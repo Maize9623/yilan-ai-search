@@ -40,6 +40,7 @@ class ZhihuContent(BaseModel):
     source_keyword: str = Field(default="", description="Source keyword")
     creator_hash: str = Field(default="", description="Creator anonymized hash")
     user_nickname: str = Field(default="", description="User nickname (masked)")
+    image_list: str = Field(default="", description="Public image URLs")
 
 
 class ZhihuComment(BaseModel):

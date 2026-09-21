@@ -301,6 +301,59 @@ def get_trace_id(img_url: str):
     return f"spectrum/{img_url.split('/')[-1]}" if img_url.find("spectrum") != -1 else img_url.split("/")[-1]
 
 
+def note_image_urls(image_list) -> list[str]:
+    urls: list[str] = []
+    seen: set[str] = set()
+    for img in image_list or []:
+        if not isinstance(img, dict):
+            continue
+        candidates = [img.get("url_default"), img.get("url")]
+        info = img.get("info_list")
+        if isinstance(info, list):
+            for item in info:
+                if isinstance(item, dict):
+                    candidates.append(item.get("url"))
+        for raw in candidates:
+            url = str(raw or "").strip()
+            if url and url not in seen:
+                seen.add(url)
+                urls.append(url)
+                break
+    return urls
+
+
+def note_from_search_item(post_item: dict) -> dict | None:
+    """Keep the search-list card when note detail is blocked."""
+    if not isinstance(post_item, dict):
+        return None
+    card = post_item.get("note_card")
+    if not isinstance(card, dict):
+        card = {}
+    note_id = str(post_item.get("id") or card.get("note_id") or "").strip()
+    title = str(card.get("display_title") or card.get("title") or card.get("desc") or "").strip()
+    if not note_id or not title:
+        return None
+    cover = card.get("cover") if isinstance(card.get("cover"), dict) else {}
+    images = card.get("image_list") if isinstance(card.get("image_list"), list) else []
+    cover_url = str(cover.get("url_default") or cover.get("url") or "").strip()
+    urls = note_image_urls(images)
+    if cover_url and cover_url not in urls:
+        urls.insert(0, cover_url)
+    return {
+        "note_id": note_id,
+        "type": card.get("type") or "normal",
+        "title": title[:255],
+        "desc": str(card.get("desc") or title),
+        "user": card.get("user") if isinstance(card.get("user"), dict) else {},
+        "interact_info": card.get("interact_info") if isinstance(card.get("interact_info"), dict) else {},
+        "image_list": [{"url": url, "url_default": url} for url in urls],
+        "tag_list": card.get("tag_list") if isinstance(card.get("tag_list"), list) else [],
+        "time": card.get("time") or card.get("timestamp") or 0,
+        "xsec_token": str(post_item.get("xsec_token") or card.get("xsec_token") or ""),
+        "xsec_source": str(post_item.get("xsec_source") or "pc_search"),
+    }
+
+
 def parse_note_info_from_note_url(url: str) -> NoteUrlInfo:
     """
     Parse note information from Xiaohongshu note URL

@@ -74,6 +74,7 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
         params: Optional[Dict] = None,
         headers: Optional[Dict] = None,
         request_method="GET",
+        force_sign: bool = False,
     ):
 
         if not params:
@@ -105,7 +106,11 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
             "screen_height": "1440",
             'effective_type': '4g',
             "round_trip_time": "50",
-            "webid": get_web_id(),
+            "webid": (
+                str(local_storage.get("webId") or local_storage.get("webid") or "")
+                or str((self.cookie_dict or {}).get("s_v_web_id") or "")
+                or get_web_id()
+            ),
             "msToken": local_storage.get("xmst"),
         }
         params.update(common_params)
@@ -116,29 +121,54 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
         if request_method == "POST":
             post_data = params
 
-        if "/v1/web/general/search" not in uri:
+        if force_sign or "/v1/web/general/search" not in uri:
             a_bogus = await get_a_bogus(uri, query_string, post_data, headers["User-Agent"], self.playwright_page)
             params["a_bogus"] = a_bogus
 
     async def request(self, method, url, **kwargs):
-        # Check whether the proxy has expired before each request
-        await self._refresh_proxy_if_expired()
+        last_error: Exception | None = None
+        response = None
+        for attempt in range(3):
+            await self._refresh_proxy_if_expired()
+            try:
+                async with make_async_client(proxy=self.proxy) as client:
+                    response = await client.request(
+                        method, url, timeout=self.timeout, **kwargs
+                    )
+                break
+            except httpx.TransportError as error:
+                last_error = error
+                utils.logger.info(
+                    f"[DouYinClient.request] 抖音接口连不上，重试 {attempt + 1}/3：{error}"
+                )
+                await asyncio.sleep(1.2 * (attempt + 1))
+        else:
+            raise DataFetchError(f"网络连不上抖音：{last_error}")
 
-        async with make_async_client(proxy=self.proxy) as client:
-            response = await client.request(method, url, timeout=self.timeout, **kwargs)
         try:
             if response.text == "" or response.text == "blocked":
-                utils.logger.error(f"request params incrr, response.text: {response.text}")
+                utils.logger.info(
+                    "[DouYinClient.request] 抖音接口被挡住了。"
+                    "请把 Chrome 窗口拉到前面自己过安全验证，过完会继续。"
+                )
                 raise Exception("account blocked")
             return response.json()
+        except DataFetchError:
+            raise
         except Exception as e:
             raise DataFetchError(f"{e}, {response.text}")
 
-    async def get(self, uri: str, params: Optional[Dict] = None, headers: Optional[Dict] = None):
+    async def get(
+        self,
+        uri: str,
+        params: Optional[Dict] = None,
+        headers: Optional[Dict] = None,
+        force_sign: bool = False,
+    ):
         """
         GET请求
         """
-        await self.__process_req_params(uri, params, headers)
+        await self.__process_req_params(uri, params, headers, force_sign=force_sign)
         headers = headers or self.headers
         return await self.request(method="GET", url=f"{self._host}{uri}", params=params, headers=headers)
 
@@ -174,6 +204,7 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
         sort_type: SearchSortType = SearchSortType.GENERAL,
         publish_time: PublishTimeType = PublishTimeType.UNLIMITED,
         search_id: str = "",
+        sign: bool = False,
     ):
         """
         DouYin Web Search API
@@ -206,7 +237,12 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
         referer_url = f"https://www.douyin.com/search/{keyword}?aid=f594bbd9-a0e2-4651-9319-ebe3cb6298c1&type=general"
         headers = copy.copy(self.headers)
         headers["Referer"] = urllib.parse.quote(referer_url, safe=':/')
-        return await self.get("/aweme/v1/web/general/search/single/", query_params, headers=headers)
+        return await self.get(
+            "/aweme/v1/web/general/search/single/",
+            query_params,
+            headers=headers,
+            force_sign=sign,
+        )
 
     async def get_video_by_id(self, aweme_id: str) -> Any:
         """

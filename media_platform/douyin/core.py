@@ -20,6 +20,7 @@
 import asyncio
 import os
 import random
+import time
 from asyncio import Task
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -37,13 +38,104 @@ from proxy.proxy_ip_pool import IpInfoModel, create_ip_pool
 from store import douyin as douyin_store
 from tools import utils
 from tools.cdp_browser import CDPBrowserManager
+from tools.chrome_launch import adopt_page, launch_persistent_chrome, restore_crawler_window, settle_crawler_window
+from tools.video_read import capture_for_board, collect_video_text, duration_ms
 from var import crawler_type_var, source_keyword_var
 
 from .client import DouYinClient
 from .exception import DataFetchError
-from .field import PublishTimeType
+from .field import PublishTimeType, SearchChannelType
 from .help import parse_video_info_from_url, parse_creator_info_from_url
 from .login import DouYinLogin
+
+
+def _search_rows(payload: Any) -> list:
+    if not isinstance(payload, dict):
+        return []
+    found: list[list] = []
+    data = payload.get("data")
+    if isinstance(data, list) and data:
+        found.append(data)
+    if isinstance(data, dict):
+        for key in ("data", "aweme_list", "business_data"):
+            rows = data.get(key)
+            if isinstance(rows, list) and rows:
+                found.append(rows)
+    for key in ("aweme_list", "business_data"):
+        rows = payload.get(key)
+        if isinstance(rows, list) and rows:
+            found.append(rows)
+    if found:
+        return max(found, key=len)
+    return data if isinstance(data, list) else []
+
+
+def _corrected_query(payload: Any, keyword: str) -> str:
+    qc = payload.get("qc") if isinstance(payload, dict) else None
+    if isinstance(qc, str) and qc.strip() and qc.strip() != keyword:
+        return qc.strip()
+    if isinstance(qc, dict):
+        text = str(qc.get("query") or qc.get("correct_query") or "").strip()
+        if text and text != keyword:
+            return text
+    return ""
+
+
+def _mix_quota(wanted: int) -> Tuple[int, int]:
+    """Split Douyin take into videos and notes. Default 70% video / 30% 图文."""
+    try:
+        note_ratio = float(os.getenv("BOARD_DY_NOTE_RATIO", "0.3"))
+    except ValueError:
+        note_ratio = 0.3
+    note_ratio = min(0.8, max(0.0, note_ratio))
+    want_note = int(wanted * note_ratio + 0.5)
+    if wanted >= 4 and want_note < 1:
+        want_note = 1
+    if want_note >= wanted and wanted > 1:
+        want_note = wanted - 1
+    return wanted - want_note, want_note
+
+
+def _search_blocked(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    nil = payload.get("search_nil_info") or {}
+    if not isinstance(nil, dict):
+        return False
+    marks = f"{nil.get('search_nil_type') or ''} {nil.get('search_nil_item') or ''}".lower()
+    return any(token in marks for token in ("verify", "captcha", "risk"))
+
+
+def _log_empty_search(keyword: str, page: int, payload: Any, stage: str) -> None:
+    if not isinstance(payload, dict):
+        utils.logger.info(
+            f"[DouYinCrawler.search] {keyword} 第 {page} 页空了（{stage}） payload={type(payload)}"
+        )
+        return
+    data = payload.get("data")
+    aweme = payload.get("aweme_list")
+    utils.logger.info(
+        f"[DouYinCrawler.search] {keyword} 第 {page} 页空了（{stage}） "
+        f"status={payload.get('status_code')} "
+        f"data_len={len(data) if isinstance(data, list) else type(data).__name__} "
+        f"aweme_len={len(aweme) if isinstance(aweme, list) else type(aweme).__name__} "
+        f"nil={payload.get('search_nil_info')} qc={payload.get('qc')}"
+    )
+
+
+def _aweme_from_post(post_item: Any) -> Dict:
+    if not isinstance(post_item, dict):
+        return {}
+    info = post_item.get("aweme_info")
+    if isinstance(info, dict):
+        return info
+    mix = post_item.get("aweme_mix_info") if isinstance(post_item.get("aweme_mix_info"), dict) else {}
+    items = mix.get("mix_items") if mix else None
+    if isinstance(items, list) and items and isinstance(items[0], dict):
+        return items[0]
+    if post_item.get("aweme_id"):
+        return post_item
+    return {}
 
 
 class DouYinCrawler(AbstractCrawler):
@@ -63,6 +155,7 @@ class DouYinCrawler(AbstractCrawler):
         ]
         self.cdp_manager = None
         self.ip_proxy_pool = None  # Proxy IP pool for automatic proxy refresh
+        self._pending_frames: List[Dict] = []
 
     async def start(self) -> None:
         playwright_proxy_format, httpx_proxy_format = None, None
@@ -94,11 +187,33 @@ class DouYinCrawler(AbstractCrawler):
                 # stealth.min.js is a js script to prevent the website from detecting the crawler.
                 await self.browser_context.add_init_script(path="libs/stealth.min.js")
 
-            self.context_page = await self.browser_context.new_page()
-            await self.context_page.goto(self.index_url)
+            self.context_page = await adopt_page(self.browser_context)
+            try:
+                await self.context_page.goto(
+                    self.index_url, wait_until="domcontentloaded", timeout=20000
+                )
+            except Exception as error:
+                utils.logger.info(
+                    f"[DouYinCrawler.start] 抖音首页没完全加载完：{error}，窗口先留着，请登录。"
+                )
 
             self.dy_client = await self.create_douyin_client(httpx_proxy_format)
-            if not await self.dy_client.pong(browser_context=self.browser_context):
+
+            async def dy_ready() -> bool:
+                try:
+                    return await self.dy_client.pong(browser_context=self.browser_context)
+                except Exception:
+                    return False
+
+            logged_in = await dy_ready()
+            if not logged_in:
+                for _ in range(4):
+                    await asyncio.sleep(1)
+                    logged_in = await dy_ready()
+                    if logged_in:
+                        break
+            if not logged_in:
+                utils.logger.info("请到弹出的 Chrome 登录抖音，有验证码也在这个窗口自己过。")
                 login_obj = DouYinLogin(
                     login_type=config.LOGIN_TYPE,
                     login_phone="",  # you phone number
@@ -106,15 +221,17 @@ class DouYinCrawler(AbstractCrawler):
                     context_page=self.context_page,
                     cookie_str=config.COOKIES,
                 )
-                await login_obj.begin()
-                await self.dy_client.update_cookies(
-                    browser_context=self.browser_context,
-                    urls=self.cookie_urls,
-                )
+                await login_obj.begin(ready=dy_ready)
+            await self.dy_client.update_cookies(
+                browser_context=self.browser_context,
+                urls=self.cookie_urls,
+            )
+            await settle_crawler_window(self.context_page, "抖音")
             crawler_type_var.set(config.CRAWLER_TYPE)
             if config.CRAWLER_TYPE == "search":
                 # Search for notes and retrieve their comment information.
                 await self.search()
+                await self._flush_board_frames()
             elif config.CRAWLER_TYPE == "detail":
                 # Get the information and comments of the specified post
                 await self.get_specified_awemes()
@@ -126,59 +243,321 @@ class DouYinCrawler(AbstractCrawler):
 
     async def search(self) -> None:
         utils.logger.info("[DouYinCrawler.search] Begin search douyin keywords")
-        dy_limit_count = 10  # douyin limit page fixed value
-        if config.CRAWLER_MAX_NOTES_COUNT < dy_limit_count:
-            config.CRAWLER_MAX_NOTES_COUNT = dy_limit_count
-        start_page = config.START_PAGE  # start page number
+        wanted = max(1, int(config.CRAWLER_MAX_NOTES_COUNT))
+        want_video, want_note = _mix_quota(wanted)
+        page_size = 15
+        start_page = max(1, int(config.START_PAGE))
+        max_page = start_page + max(8, (wanted + page_size - 1) // page_size + 6)
         for keyword in config.KEYWORDS.split(","):
             source_keyword_var.set(keyword)
-            utils.logger.info(f"[DouYinCrawler.search] Current keyword: {keyword}")
-            aweme_list: List[str] = []
-            page = 0
+            utils.logger.info(
+                f"[DouYinCrawler.search] Current keyword: {keyword}；"
+                f"目标 {want_video} 条视频、{want_note} 条图文（约 7:3）"
+            )
+            kept_ids: set[str] = set()
+            n_video = 0
+            n_note = 0
+            page = start_page
             dy_search_id = ""
-            while (page - start_page + 1) * dy_limit_count <= config.CRAWLER_MAX_NOTES_COUNT:
-                if page < start_page:
-                    utils.logger.info(f"[DouYinCrawler.search] Skip {page}")
-                    page += 1
-                    continue
+            asked_login = False
+            # 综合搜索才有结果；视频频道走同一接口经常是空的，空了还会被误判成没登录。
+            channel = SearchChannelType.GENERAL
+            note_miss = 0
+            video_miss = 0
+            while n_video + n_note < wanted and page <= max_page:
+                offset = (page - start_page) * page_size
                 try:
-                    utils.logger.info(f"[DouYinCrawler.search] search douyin keyword: {keyword}, page: {page}")
-                    posts_res = await self.dy_client.search_info_by_keyword(
-                        keyword=keyword,
-                        offset=page * dy_limit_count - dy_limit_count,
-                        publish_time=PublishTimeType(config.PUBLISH_TIME_TYPE),
-                        search_id=dy_search_id,
+                    utils.logger.info(
+                        f"[DouYinCrawler.search] search douyin keyword: {keyword}, page: {page}, channel: {channel.value}"
                     )
-                    if posts_res.get("data") is None or posts_res.get("data") == []:
-                        utils.logger.info(f"[DouYinCrawler.search] search douyin keyword: {keyword}, page: {page} is empty,{posts_res.get('data')}`")
+                    posts_res = await self._fetch_search_page(
+                        keyword,
+                        page,
+                        offset,
+                        channel,
+                        dy_search_id,
+                        prime=(page == start_page and not kept_ids),
+                    )
+                except DataFetchError as error:
+                    utils.logger.error(
+                        f"[DouYinCrawler.search] search douyin keyword: {keyword} failed: {error}"
+                    )
+                    if "网络连不上" in str(error):
+                        utils.logger.info(
+                            f"[DouYinCrawler.search] 抖音这一页连不上，先用已经收下的 {n_video + n_note} 条。"
+                        )
                         break
-                except DataFetchError:
-                    utils.logger.error(f"[DouYinCrawler.search] search douyin keyword: {keyword} failed")
-                    break
-
-                page += 1
-                if "data" not in posts_res:
-                    utils.logger.error(f"[DouYinCrawler.search] search douyin keyword: {keyword} failed，账号也许被风控了。")
-                    break
-                dy_search_id = posts_res.get("extra", {}).get("logid", "")
-                page_aweme_list = []
-                for post_item in posts_res.get("data"):
-                    try:
-                        aweme_info: Dict = (post_item.get("aweme_info") or post_item.get("aweme_mix_info", {}).get("mix_items")[0])
-                    except TypeError:
+                    if not asked_login and not await self._is_logged_in():
+                        asked_login = True
+                        await self._wait_and_retry_login()
                         continue
-                    aweme_list.append(aweme_info.get("aweme_id", ""))
-                    page_aweme_list.append(aweme_info.get("aweme_id", ""))
-                    await douyin_store.update_douyin_aweme(aweme_item=aweme_info)
-                    await self.get_aweme_media(aweme_item=aweme_info)
-                
-                # Batch get note comments for the current page
-                await self.batch_get_note_comments(page_aweme_list)
+                    break
+                except Exception as error:
+                    utils.logger.info(
+                        f"[DouYinCrawler.search] 抖音搜索中断：{error}，先用已经收下的 {n_video + n_note} 条。"
+                    )
+                    break
 
-                # Sleep after each page navigation
+                rows = _search_rows(posts_res)
+                if not rows:
+                    _log_empty_search(keyword, page, posts_res, "最终")
+                    if not asked_login and not await self._is_logged_in():
+                        asked_login = True
+                        await self._wait_and_retry_login()
+                        continue
+                    break
+                extra = posts_res.get("extra") if isinstance(posts_res, dict) else {}
+                dy_search_id = extra.get("logid", "") if isinstance(extra, dict) else ""
+                page_ids: List[str] = []
+                page_videos = 0
+                page_notes = 0
+                saw_video = False
+                saw_note = False
+                for post_item in rows:
+                    if n_video + n_note >= wanted:
+                        break
+                    aweme_info = _aweme_from_post(post_item)
+                    if not aweme_info:
+                        continue
+                    aweme_id = str(aweme_info.get("aweme_id") or "")
+                    if not aweme_id or aweme_id in kept_ids:
+                        continue
+                    is_video = douyin_store.is_short_video(aweme_info)
+                    if is_video:
+                        saw_video = True
+                        if n_video >= want_video:
+                            continue
+                    else:
+                        saw_note = True
+                        if n_note >= want_note:
+                            continue
+                    kept_ids.add(aweme_id)
+                    await self._keep_aweme(aweme_info)
+                    page_ids.append(aweme_id)
+                    if is_video:
+                        n_video += 1
+                        page_videos += 1
+                    else:
+                        n_note += 1
+                        page_notes += 1
+
+                utils.logger.info(
+                    f"[DouYinCrawler.search] 本页取 {page_videos} 条视频、{page_notes} 条图文，"
+                    f"累计视频 {n_video}/{want_video}、图文 {n_note}/{want_note}"
+                )
+                if not page_ids:
+                    if n_note < want_note and not saw_note:
+                        note_miss += 1
+                    if n_video < want_video and not saw_video:
+                        video_miss += 1
+                    if n_note < want_note and note_miss >= 3:
+                        utils.logger.info(
+                            "[DouYinCrawler.search] 图文不够了，余下名额给视频。"
+                        )
+                        want_note = n_note
+                        want_video = wanted - want_note
+                        note_miss = 0
+                    if n_video < want_video and video_miss >= 3:
+                        utils.logger.info(
+                            "[DouYinCrawler.search] 视频不够了，余下名额给图文。"
+                        )
+                        want_video = n_video
+                        want_note = wanted - want_video
+                        video_miss = 0
+                    if note_miss >= 3 and video_miss >= 3:
+                        break
+                    page += 1
+                    await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
+                    continue
+                note_miss = 0
+                video_miss = 0
+                await self.batch_get_note_comments(page_ids)
+                page += 1
                 await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
                 utils.logger.info(f"[DouYinCrawler.search] Sleeping for {config.CRAWLER_MAX_SLEEP_SEC} seconds after page {page-1}")
-            utils.logger.info(f"[DouYinCrawler.search] keyword:{keyword}, aweme_list:{aweme_list}")
+            utils.logger.info(
+                f"[DouYinCrawler.search] keyword:{keyword} 已写下视频 {n_video}、图文 {n_note}"
+            )
+
+    async def _fetch_search_page(
+        self,
+        keyword: str,
+        page: int,
+        offset: int,
+        channel: SearchChannelType,
+        search_id: str,
+        *,
+        prime: bool,
+    ) -> Any:
+        async def once(word: str, sign: bool) -> Any:
+            return await self.dy_client.search_info_by_keyword(
+                keyword=word,
+                offset=offset,
+                publish_time=PublishTimeType(config.PUBLISH_TIME_TYPE),
+                search_id=search_id,
+                search_channel=channel,
+                sign=sign,
+            )
+
+        posts_res = await once(keyword, False)
+        if _search_rows(posts_res):
+            return posts_res
+        if _search_blocked(posts_res):
+            _log_empty_search(keyword, page, posts_res, "要验证")
+            return await self._wait_for_search_verify(keyword, once)
+        _log_empty_search(keyword, page, posts_res, "未签名")
+        posts_res = await once(keyword, True)
+        if _search_rows(posts_res):
+            return posts_res
+        if _search_blocked(posts_res):
+            _log_empty_search(keyword, page, posts_res, "要验证")
+            return await self._wait_for_search_verify(keyword, once)
+        _log_empty_search(keyword, page, posts_res, "已签名")
+        if prime:
+            await self._prime_search_page(keyword)
+            posts_res = await once(keyword, True)
+            if _search_rows(posts_res):
+                return posts_res
+            if _search_blocked(posts_res):
+                _log_empty_search(keyword, page, posts_res, "要验证")
+                return await self._wait_for_search_verify(keyword, once)
+            _log_empty_search(keyword, page, posts_res, "打开搜索页后")
+            alt = _corrected_query(posts_res, keyword)
+            if alt:
+                utils.logger.info(f"[DouYinCrawler.search] 改用纠错词再搜：{alt}")
+                posts_res = await once(alt, True)
+        return posts_res
+
+    async def _prime_search_page(self, keyword: str) -> None:
+        from urllib.parse import quote
+
+        url = f"https://www.douyin.com/search/{quote(keyword)}?type=general"
+        utils.logger.info("[DouYinCrawler.search] 打开搜索页补令牌。")
+        try:
+            await self.context_page.goto(url, wait_until="domcontentloaded", timeout=18000)
+            await asyncio.sleep(1.2)
+        except Exception as error:
+            utils.logger.info(f"[DouYinCrawler.search] 搜索页没打开完：{error}，仍走接口。")
+        await self.dy_client.update_cookies(
+            browser_context=self.browser_context,
+            urls=self.cookie_urls,
+        )
+
+    async def _wait_for_search_verify(self, keyword: str, once) -> Any:
+        from tools.login_ready import page_needs_verify
+
+        utils.logger.info(
+            "抖音被安全验证挡住了。请把 Chrome 窗口拉到前面自己过，过完会继续搜。不要关这个窗口。"
+        )
+        await restore_crawler_window(self.context_page)
+        try:
+            if not await page_needs_verify(self.context_page):
+                await self._prime_search_page(keyword)
+                await restore_crawler_window(self.context_page)
+        except Exception:
+            await restore_crawler_window(self.context_page)
+        posts_res: Any = {}
+        started = time.monotonic()
+        deadline = started + 180
+        last_beat = 0.0
+        while time.monotonic() < deadline:
+            try:
+                posts_res = await once(keyword, True)
+            except Exception:
+                posts_res = {}
+            if _search_rows(posts_res):
+                utils.logger.info("抖音安全验证已过，继续搜。")
+                await self.dy_client.update_cookies(
+                    browser_context=self.browser_context,
+                    urls=self.cookie_urls,
+                )
+                await settle_crawler_window(self.context_page, "抖音")
+                return posts_res
+            if posts_res and not _search_blocked(posts_res):
+                return posts_res
+            elapsed = time.monotonic() - started
+            if elapsed - last_beat >= 12:
+                last_beat = elapsed
+                utils.logger.info(
+                    "还在等你过抖音安全验证。窗口已拉到前面，自己点完即可，不要关这次搜索。"
+                )
+            await asyncio.sleep(2.5)
+        utils.logger.info("抖音安全验证还没过。过完后点重新搜。")
+        return posts_res
+
+    async def _is_logged_in(self) -> bool:
+        try:
+            return await self.dy_client.pong(browser_context=self.browser_context)
+        except Exception:
+            return False
+
+    async def _keep_aweme(self, aweme_info: Dict) -> None:
+        await douyin_store.update_douyin_aweme(aweme_item=aweme_info)
+        if douyin_store.is_short_video(aweme_info):
+            self._pending_frames.append(aweme_info)
+        await self.get_aweme_media(aweme_item=aweme_info)
+
+    async def _flush_board_frames(self) -> None:
+        """Write titles first. Frames are optional leftover work, never block search."""
+        if not self._pending_frames:
+            return
+        from tools.video_read import frames_budget, video_read_enabled
+
+        if not video_read_enabled():
+            return
+        deadline = time.monotonic() + 90
+        budget = frames_budget()
+        utils.logger.info(
+            f"[DouYinCrawler] 条目已写下 {len(self._pending_frames)} 条，再用最多 90 秒抽 {budget} 条的帧。"
+        )
+        for aweme_info in self._pending_frames[:budget]:
+            if time.monotonic() >= deadline:
+                utils.logger.info("[DouYinCrawler] 抽帧时间到，先交已经写下的条目。")
+                break
+            try:
+                await asyncio.wait_for(
+                    capture_for_board(
+                        platform="douyin",
+                        item_id=str(aweme_info.get("aweme_id") or ""),
+                        play_url=douyin_store._extract_video_download_url(aweme_info),
+                        cover_url=douyin_store._extract_content_cover_url(aweme_info),
+                        duration_ms_value=duration_ms(aweme_info),
+                        video_text=collect_video_text(aweme_info),
+                        headers={
+                            "User-Agent": self.dy_client.headers.get("User-Agent", ""),
+                            "Referer": "https://www.douyin.com/",
+                            "Cookie": self.dy_client.headers.get("Cookie", ""),
+                        },
+                    ),
+                    timeout=22,
+                )
+            except Exception as error:
+                utils.logger.info(f"[DouYinCrawler] 这条没截到帧：{error}")
+        self._pending_frames = []
+
+    async def _wait_and_retry_login(self) -> None:
+        utils.logger.info("请到弹出的 Chrome 登录抖音，过完会再搜一次。不要关这个窗口。")
+        await restore_crawler_window(self.context_page)
+        login_obj = DouYinLogin(
+            login_type=config.LOGIN_TYPE,
+            login_phone="",
+            browser_context=self.browser_context,
+            context_page=self.context_page,
+            cookie_str=config.COOKIES,
+        )
+
+        async def dy_ready() -> bool:
+            try:
+                return await self.dy_client.pong(browser_context=self.browser_context)
+            except Exception:
+                return False
+
+        await login_obj.begin(ready=dy_ready)
+        await self.dy_client.update_cookies(
+            browser_context=self.browser_context,
+            urls=self.cookie_urls,
+        )
+        await settle_crawler_window(self.context_page, "抖音")
 
     async def get_specified_awemes(self):
         """Get the information and comments of the specified post from URLs or IDs"""
@@ -338,20 +717,16 @@ class DouYinCrawler(AbstractCrawler):
         """Launch browser and create browser context"""
         if config.SAVE_LOGIN_STATE:
             user_data_dir = os.path.join(os.getcwd(), "browser_data", config.USER_DATA_DIR % config.PLATFORM)  # type: ignore
-            browser_context = await chromium.launch_persistent_context(
-                user_data_dir=user_data_dir,
-                accept_downloads=True,
+            browser_context = await launch_persistent_chrome(
+                chromium,
+                user_data_dir,
                 headless=headless,
-                proxy=playwright_proxy,  # type: ignore
-                viewport={
-                    "width": 1920,
-                    "height": 1080
-                },
+                proxy=playwright_proxy,
                 user_agent=user_agent,
-            )  # type: ignore
+            )
             return browser_context
         else:
-            browser = await chromium.launch(headless=headless, proxy=playwright_proxy)  # type: ignore
+            browser = await chromium.launch(headless=headless, proxy=playwright_proxy, channel="chrome")  # type: ignore
             browser_context = await browser.new_context(viewport={"width": 1920, "height": 1080}, user_agent=user_agent)
             return browser_context
 

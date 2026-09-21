@@ -159,6 +159,40 @@ def test_weibo_note_masks_user_info():
     assert captured["liked_count"] == "10"
     assert captured["comments_count"] == "2"
     assert captured["shared_count"] == "1"
+    assert "image_list" not in captured
+
+
+def test_weibo_note_keeps_public_image_urls():
+    """配图只写公开 URL，不下载文件，也不把头像写进去。"""
+    import store.weibo as wb
+    from media_platform.weibo.help import weibo_pic_urls, weibo_tags
+
+    note = make_mock_note()
+    note["mblog"]["text"] = "今天天气不错 #中秋活动# 出去玩"
+    note["mblog"]["pics"] = [
+        {
+            "pid": "abc123",
+            "url": "https://wx1.sinaimg.cn/orj360/abc123.jpg",
+            "large": {"url": "https://wx1.sinaimg.cn/large/abc123.jpg"},
+        }
+    ]
+    note["mblog"]["user"]["avatar_hd"] = "https://wx avatar.example.com/7654321.jpg"
+
+    assert weibo_pic_urls(note["mblog"]) == ["https://wx1.sinaimg.cn/large/abc123.jpg"]
+    assert weibo_tags("今天天气不错 #中秋活动# 出去玩") == ["中秋活动"]
+
+    fake = _FakeStore()
+    wb_, orig = _patch_factory(fake)
+    try:
+        asyncio.run(wb.update_weibo_note(note))
+    finally:
+        _restore(wb_, orig)
+
+    captured = fake.captured_content
+    assert captured["image_list"] == "https://wx1.sinaimg.cn/large/abc123.jpg"
+    assert captured["tag_list"] == "中秋活动"
+    assert "avatar" not in captured
+    assert "https://wx avatar.example.com" not in captured.get("image_list", "")
 
 
 def test_weibo_comment_masks_user_info():
@@ -232,8 +266,15 @@ def test_weibo_store_end_to_end_sqlite():
     Session = sessionmaker(bind=engine)
     session = Session()
     try:
-        # ---- 3. note:构造 ORM 对象(dict 多了已删列会直接 TypeError)并写入 ----
-        note_obj = WeiboNote(**captured_note)  # 不抛异常 => key 与 ORM 列对得上
+        # ---- 3. note:构造 ORM 对象。看板会多写 fans/image_list/tag_list，
+        # ORM 没有这些列；生产 sqlite 走 _filter_model_fields。这里只断言
+        # 多出来的键不是禁用字段，再用过滤后的 dict 写入。 ----
+        from store.weibo._store_impl import _filter_model_fields
+
+        extra_note = set(captured_note) - {c.name for c in WeiboNote.__table__.columns}
+        assert not (extra_note & FORBIDDEN_KEYS), f"note 多写了禁用键: {extra_note & FORBIDDEN_KEYS}"
+        assert extra_note <= {"fans", "image_list", "tag_list"}
+        note_obj = WeiboNote(**_filter_model_fields(WeiboNote, captured_note))
         session.add(note_obj)
         session.commit()
 

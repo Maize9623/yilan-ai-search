@@ -26,7 +26,7 @@
 import re
 import urllib.parse
 from hashlib import md5
-from typing import Dict
+from typing import Any, Dict, List
 
 from model.m_bilibili import VideoUrlInfo, CreatorUrlInfo
 from tools import utils
@@ -129,6 +129,26 @@ def parse_creator_info_from_url(url: str) -> CreatorUrlInfo:
         return CreatorUrlInfo(creator_id=creator_id)
 
     raise ValueError(f"Unable to parse creator ID from URL: {url}")
+
+
+def search_video_hits(payload: Any) -> List[Dict]:
+    result = payload.get("result") if isinstance(payload, dict) else None
+    rows: List[Dict] = []
+    if not isinstance(result, list):
+        return rows
+    for item in result:
+        if not isinstance(item, dict):
+            continue
+        grouped = item.get("data")
+        if item.get("result_type") == "video" and isinstance(grouped, list):
+            rows.extend(row for row in grouped if isinstance(row, dict))
+            continue
+        kind = str(item.get("type") or "")
+        if kind and kind != "video":
+            continue
+        if item.get("aid") or item.get("bvid") or item.get("id"):
+            rows.append(item)
+    return rows
 
 
 if __name__ == '__main__':

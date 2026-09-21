@@ -5,7 +5,9 @@
 # 出于教学与防骚扰定位，爬取结果中不保留任何可定位到真人的用户个人信息
 # （用户 ID、IP 归属地、头像、主页链接、签名、性别等一律不采集；
 # 昵称保留但做中间脱敏）。本模块提供匿名化与脱敏工具。
+# 本地看板可设 BOARD_KEEP_CREATORS=1，只在本机智搜里留下原名和粉丝数。
 import hashlib
+import os
 
 
 def anonymize_user_id(user_id) -> str:
@@ -34,3 +36,59 @@ def mask_nickname(name) -> str:
     if len(s) == 2:
         return s[0] + "*"
     return s[0] + "***" + s[-1]
+
+
+def keep_creators() -> bool:
+    return os.getenv("BOARD_KEEP_CREATORS", "").strip() == "1"
+
+
+def store_nickname(name) -> str:
+    if keep_creators():
+        return "" if name is None else str(name).strip()
+    return mask_nickname(name)
+
+
+def pick_fans(*objs) -> str:
+    keys = (
+        "fans",
+        "fans_count",
+        "fan_count",
+        "fansCount",
+        "fanCount",
+        "follower_count",
+        "followers_count",
+        "followerCount",
+        "followers",
+        "fans_num",
+        "follower",
+    )
+    for obj in objs:
+        if not isinstance(obj, dict):
+            continue
+        for key in keys:
+            value = obj.get(key)
+            if value in (None, "", 0, "0"):
+                continue
+            text = str(value).strip()
+            if text:
+                return text
+        for nested_key in ("interact_info", "statistics", "stat", "card", "basicInfo"):
+            nested = obj.get(nested_key)
+            if not isinstance(nested, dict):
+                continue
+            for key in keys:
+                value = nested.get(key)
+                if value in (None, "", 0, "0"):
+                    continue
+                text = str(value).strip()
+                if text:
+                    return text
+        for row in obj.get("interactions") or []:
+            if not isinstance(row, dict):
+                continue
+            kind = str(row.get("type") or row.get("name") or "")
+            if kind in {"fans", "fan", "follower", "粉丝"}:
+                text = str(row.get("count") or row.get("value") or "").strip()
+                if text:
+                    return text
+    return ""

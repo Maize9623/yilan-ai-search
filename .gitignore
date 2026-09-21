@@ -184,3 +184,13 @@ debug_tools
 
 database/*.db
 .omx/
+
+# Personal search board overlay
+board/.env
+board/runs/
+board/keys.json
+board/setup.json
+board/agents/
+
+.DS_Store
+**/.DS_Store

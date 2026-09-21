@@ -108,7 +108,12 @@ class ZhihuDbStoreImplement(AbstractStore):
             else:
                 if "add_ts" not in content_item:
                     content_item["add_ts"] = utils.get_current_timestamp()
-                new_content = ZhihuContent(**content_item)
+                payload = {
+                    key: value
+                    for key, value in content_item.items()
+                    if hasattr(ZhihuContent, key)
+                }
+                new_content = ZhihuContent(**payload)
                 session.add(new_content)
             await session.commit()
 

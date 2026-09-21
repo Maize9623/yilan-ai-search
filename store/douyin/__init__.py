@@ -25,7 +25,9 @@ from typing import List
 
 import config
 from var import source_keyword_var
-from tools.user_hash import anonymize_user_id, mask_nickname
+from tools.user_hash import anonymize_user_id, pick_fans, store_nickname
+
+from tools.video_read import classify_caption_source, collect_caption_text, duration_ms
 
 from ._store_impl import *
 from .douyin_store_media import *
@@ -99,6 +101,18 @@ def _extract_comment_image_list(comment_item: Dict) -> List[str]:
     return images_res
 
 
+NOTE_AWEME_TYPES = {"2", "68", "101"}
+
+
+def is_short_video(aweme_item: Dict) -> bool:
+    aweme_type = str(aweme_item.get("aweme_type") or "")
+    if aweme_type in NOTE_AWEME_TYPES:
+        return False
+    if _extract_note_image_list(aweme_item) and aweme_type not in {"0", "4"}:
+        return False
+    return True
+
+
 def _extract_content_cover_url(aweme_detail: Dict) -> str:
     """
     Extract video cover URL
@@ -109,14 +123,12 @@ def _extract_content_cover_url(aweme_detail: Dict) -> str:
     Returns:
         str: Video cover URL
     """
-    res_cover_url = ""
-
-    video_item = aweme_detail.get("video", {})
-    raw_cover_url_list = (video_item.get("raw_cover", {}) or video_item.get("origin_cover", {})).get("url_list", [])
-    if raw_cover_url_list and len(raw_cover_url_list) > 1:
-        res_cover_url = raw_cover_url_list[1]
-
-    return res_cover_url
+    video_item = aweme_detail.get("video") or {}
+    for key in ("raw_cover", "origin_cover", "cover", "dynamic_cover"):
+        urls = (video_item.get(key) or {}).get("url_list") or []
+        if urls:
+            return urls[0]
+    return ""
 
 
 def _extract_video_download_url(aweme_detail: Dict) -> str:
@@ -134,7 +146,7 @@ def _extract_video_download_url(aweme_detail: Dict) -> str:
     url_256_list = video_item.get("play_addr_256", {}).get("url_list", [])
     url_list = video_item.get("play_addr", {}).get("url_list", [])
     actual_url_list = url_h264_list or url_256_list or url_list
-    if not actual_url_list or len(actual_url_list) < 2:
+    if not actual_url_list:
         return ""
     return actual_url_list[-1]
 
@@ -159,14 +171,17 @@ async def update_douyin_aweme(aweme_item: Dict):
     aweme_id = aweme_item.get("aweme_id")
     user_info = aweme_item.get("author", {})
     interact_info = aweme_item.get("statistics", {})
+    desc = str(aweme_item.get("desc") or "")
+    spoken = collect_caption_text(aweme_item) or desc
     save_content_item = {
         "aweme_id": aweme_id,
         "aweme_type": str(aweme_item.get("aweme_type")),
-        "title": aweme_item.get("desc", ""),
-        "desc": aweme_item.get("desc", ""),
+        "title": desc,
+        "desc": desc,
         "create_time": aweme_item.get("create_time"),
         "creator_hash": anonymize_user_id(user_info.get("uid")),  # 创作者匿名哈希(不存原始 uid)
-        "nickname": mask_nickname(user_info.get("nickname")),  # 用户昵称(已脱敏)
+        "nickname": store_nickname(user_info.get("nickname")),
+        "fans": pick_fans(user_info, aweme_item),
         "liked_count": str(interact_info.get("digg_count")),
         "collected_count": str(interact_info.get("collect_count")),
         "comment_count": str(interact_info.get("comment_count")),
@@ -177,6 +192,9 @@ async def update_douyin_aweme(aweme_item: Dict):
         "video_download_url": _extract_video_download_url(aweme_item),
         "music_download_url": _extract_music_download_url(aweme_item),
         "note_download_url": ",".join(_extract_note_image_list(aweme_item)),
+        "duration_ms": duration_ms(aweme_item),
+        "video_text": spoken,
+        "text_source": classify_caption_source(desc),
         "source_keyword": source_keyword_var.get(),
     }
     utils.logger.info(f"[store.douyin.update_douyin_aweme] douyin aweme id:{aweme_id}, title:{save_content_item.get('title')}")
@@ -204,7 +222,7 @@ async def update_dy_aweme_comment(aweme_id: str, comment_item: Dict):
         "aweme_id": aweme_id,
         "content": comment_item.get("text"),
         "creator_hash": anonymize_user_id(user_info.get("uid")),  # 创作者匿名哈希(不存原始 uid)
-        "nickname": mask_nickname(user_info.get("nickname")),  # 用户昵称(已脱敏)
+        "nickname": store_nickname(user_info.get("nickname")),
         "sub_comment_count": str(comment_item.get("reply_comment_total", 0)),
         "like_count": (comment_item.get("digg_count") if comment_item.get("digg_count") else 0),
         "last_modify_ts": utils.get_current_timestamp(),

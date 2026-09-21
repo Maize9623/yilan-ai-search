@@ -105,9 +105,27 @@ class CDPBrowserManager:
         Launch browser and connect via CDP
         """
         try:
-            if config.CDP_CONNECT_EXISTING:
-                # Connect to an existing browser that already has remote debugging enabled
-                return await self._connect_existing_browser(playwright, playwright_proxy, user_agent)
+            if config.CDP_CONNECT_EXISTING or await self._test_cdp_connection(
+                config.CDP_DEBUG_PORT
+            ):
+                try:
+                    utils.logger.info(
+                        "[CDPBrowserManager] 先连已打开的 Chrome。登录过的站点会直接复用。"
+                    )
+                    return await self._connect_existing_browser(
+                        playwright, playwright_proxy, user_agent
+                    )
+                except Exception as existing_error:
+                    if await self._test_cdp_connection(config.CDP_DEBUG_PORT):
+                        utils.logger.error(
+                            "[CDPBrowserManager] 搜索专用 Chrome 开着但连不上："
+                            f"{existing_error}。不要再开第二个窗口，"
+                            "关掉那个 Chrome 后再搜一次，让程序自己打开同一份登录配置。"
+                        )
+                        raise
+                    utils.logger.warning(
+                        "[CDPBrowserManager] 没有可连的 Chrome，将打开同一份登录配置的窗口。"
+                    )
 
             # 1. Detect browser path
             browser_path = await self._get_browser_path()
@@ -254,11 +272,8 @@ class CDPBrowserManager:
         # Set user data directory (if save login state is enabled)
         user_data_dir = None
         if config.SAVE_LOGIN_STATE:
-            user_data_dir = os.path.join(
-                os.getcwd(),
-                "browser_data",
-                f"cdp_{config.USER_DATA_DIR % config.PLATFORM}",
-            )
+            # One shared profile so each platform is logged in once, not every search.
+            user_data_dir = os.path.join(os.path.expanduser("~"), "chrome-mediacrawler")
             os.makedirs(user_data_dir, exist_ok=True)
             utils.logger.info(f"[CDPBrowserManager] User data directory: {user_data_dir}")
 
@@ -290,14 +305,15 @@ class CDPBrowserManager:
         Get browser WebSocket connection URL
         """
         try:
-            async with httpx.AsyncClient() as client:
+            async with httpx.AsyncClient(trust_env=False) as client:
                 response = await client.get(
-                    f"http://localhost:{debug_port}/json/version", timeout=10
+                    f"http://127.0.0.1:{debug_port}/json/version", timeout=10
                 )
                 if response.status_code == 200:
                     data = response.json()
                     ws_url = data.get("webSocketDebuggerUrl")
                     if ws_url:
+                        ws_url = ws_url.replace("://localhost", "://127.0.0.1")
                         utils.logger.info(
                             f"[CDPBrowserManager] Got browser WebSocket URL: {ws_url}"
                         )
@@ -316,28 +332,23 @@ class CDPBrowserManager:
         """
         try:
             if config.CDP_CONNECT_EXISTING:
-                # Existing browser remote debugging in Chrome 136+ does not expose
-                # /json/version. Connect directly and wait for user confirmation.
-                ws_url = f"ws://localhost:{self.debug_port}/devtools/browser"
-                utils.logger.info(f"[CDPBrowserManager] Connecting to existing browser via CDP: {ws_url}")
-                utils.logger.info(
-                    "[CDPBrowserManager] Please check your browser for a confirmation dialog and accept it"
-                )
+                timeout_ms = config.BROWSER_LAUNCH_TIMEOUT * 1000
                 try:
-                    self.browser = await playwright.chromium.connect_over_cdp(
-                        ws_url, timeout=config.BROWSER_LAUNCH_TIMEOUT * 1000
-                    )
-                except Exception as direct_error:
-                    utils.logger.warning(
-                        "[CDPBrowserManager] Direct existing-browser CDP connection failed: "
-                        f"{direct_error}. Trying /json/version discovery..."
-                    )
                     ws_url = await self._get_browser_websocket_url(self.debug_port)
                     utils.logger.info(
                         f"[CDPBrowserManager] Connecting to existing browser via discovered CDP: {ws_url}"
                     )
                     self.browser = await playwright.chromium.connect_over_cdp(
-                        ws_url, timeout=config.BROWSER_LAUNCH_TIMEOUT * 1000
+                        ws_url, timeout=timeout_ms
+                    )
+                except Exception as discover_error:
+                    http_url = f"http://127.0.0.1:{self.debug_port}"
+                    utils.logger.warning(
+                        "[CDPBrowserManager] /json/version discovery failed: "
+                        f"{discover_error}. Trying {http_url}"
+                    )
+                    self.browser = await playwright.chromium.connect_over_cdp(
+                        http_url, timeout=timeout_ms
                     )
             else:
                 # For launched browser, get WebSocket URL first

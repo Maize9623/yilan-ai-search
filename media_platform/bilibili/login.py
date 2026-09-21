@@ -26,7 +26,7 @@
 import asyncio
 import functools
 import sys
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 from playwright.async_api import BrowserContext, Page
 from tenacity import (RetryError, retry, retry_if_result, stop_after_attempt,
@@ -51,18 +51,17 @@ class BilibiliLogin(AbstractLogin):
         self.login_phone = login_phone
         self.cookie_str = cookie_str
 
-    async def begin(self):
+    async def begin(self, ready: Optional[Callable[[], Awaitable[bool]]] = None):
         """Start login bilibili"""
-        utils.logger.info("[BilibiliLogin.begin] Begin login Bilibili ...")
-        if config.LOGIN_TYPE == "qrcode":
-            await self.login_by_qrcode()
-        elif config.LOGIN_TYPE == "phone":
-            await self.login_by_mobile()
-        elif config.LOGIN_TYPE == "cookie":
-            await self.login_by_cookies()
-        else:
-            raise ValueError(
-                "[BilibiliLogin.begin] Invalid Login Type Currently only supported qrcode or phone or cookie ...")
+        from tools.login_ready import complete_login_if_needed
+
+        await complete_login_if_needed(
+            self.browser_context,
+            self.context_page,
+            "bili",
+            cookie_login=self.login_by_cookies,
+            ready=ready,
+        )
 
     @retry(stop=stop_after_attempt(600), wait=wait_fixed(1), retry=retry_if_result(lambda value: value is False))
     async def check_login_state(self) -> bool:

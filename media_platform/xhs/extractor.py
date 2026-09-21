@@ -28,6 +28,24 @@ class XiaoHongShuExtractor:
     def __init__(self):
         pass
 
+    @staticmethod
+    def pick_note_from_state(state, note_id: str) -> Optional[Dict]:
+        if not isinstance(state, dict) or not note_id:
+            return None
+        note = state.get("note")
+        if not isinstance(note, dict):
+            return None
+        detail_map = note.get("noteDetailMap") or note.get("note_detail_map") or {}
+        if not isinstance(detail_map, dict):
+            return None
+        entry = detail_map.get(note_id)
+        if not isinstance(entry, dict):
+            return None
+        raw = entry.get("note")
+        if not isinstance(raw, dict):
+            return None
+        return humps.decamelize(raw)
+
     def extract_note_detail_from_html(self, note_id: str, html: str) -> Optional[Dict]:
         """Extract note details from HTML
 
@@ -37,17 +55,16 @@ class XiaoHongShuExtractor:
         Returns:
             Dict: Note details dictionary
         """
-        if "noteDetailMap" not in html:
-            # Either a CAPTCHA appeared or the note doesn't exist
+        if "noteDetailMap" not in html and "note_detail_map" not in html:
             return None
 
-        state = re.findall(r"window.__INITIAL_STATE__=({.*})</script>", html)[
-            0
-        ].replace("undefined", '""')
-        if state != "{}":
-            note_dict = humps.decamelize(json.loads(state))
-            return note_dict["note"]["note_detail_map"][note_id]["note"]
-        return None
+        found = re.findall(r"window.__INITIAL_STATE__=({.*})</script>", html)
+        if not found:
+            return None
+        state = found[0].replace("undefined", '""')
+        if state == "{}":
+            return None
+        return self.pick_note_from_state(json.loads(state), note_id)
 
     def extract_creator_info_from_html(self, html: str) -> Optional[Dict]:
         """Extract user information from HTML

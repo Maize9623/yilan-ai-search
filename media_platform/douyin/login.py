@@ -50,43 +50,22 @@ class DouYinLogin(AbstractLogin):
         self.scan_qrcode_time = 60
         self.cookie_str = cookie_str
 
-    async def begin(self):
+    async def begin(self, ready=None):
         """
             Start login douyin website
             The verification accuracy of the slider verification is not very good... If there are no special requirements, it is recommended not to use Douyin login, or use cookie login
         """
+        from tools.login_ready import already_logged_in, complete_login_if_needed
 
-        # popup login dialog
-        await self.popup_login_dialog()
-
-        # select login type
-        if config.LOGIN_TYPE == "qrcode":
-            await self.login_by_qrcode()
-        elif config.LOGIN_TYPE == "phone":
-            await self.login_by_mobile()
-        elif config.LOGIN_TYPE == "cookie":
-            await self.login_by_cookies()
-        else:
-            raise ValueError("[DouYinLogin.begin] Invalid Login Type Currently only supported qrcode or phone or cookie ...")
-
-        # If the page redirects to the slider verification page, need to slide again
-        await asyncio.sleep(6)
-        current_page_title = await self.context_page.title()
-        if "验证码中间页" in current_page_title:
-            await self.check_page_display_slider(move_step=3, slider_level="hard")
-
-        # check login state
-        utils.logger.info(f"[DouYinLogin.begin] login finished then check login state ...")
-        try:
-            await self.check_login_state()
-        except RetryError:
-            utils.logger.info("[DouYinLogin.begin] login failed please confirm ...")
-            sys.exit()
-
-        # wait for redirect
-        wait_redirect_seconds = 5
-        utils.logger.info(f"[DouYinLogin.begin] Login successful then wait for {wait_redirect_seconds} seconds redirect ...")
-        await asyncio.sleep(wait_redirect_seconds)
+        if not await already_logged_in(self.browser_context, self.context_page, "dy"):
+            await self.popup_login_dialog()
+        await complete_login_if_needed(
+            self.browser_context,
+            self.context_page,
+            "dy",
+            cookie_login=self.login_by_cookies,
+            ready=ready,
+        )
 
     @retry(stop=stop_after_attempt(600), wait=wait_fixed(1), retry=retry_if_result(lambda value: value is False))
     async def check_login_state(self):
@@ -109,17 +88,27 @@ class DouYinLogin(AbstractLogin):
         return False
 
     async def popup_login_dialog(self):
-        """If the login dialog box does not pop up automatically, we will manually click the login button"""
-        dialog_selector = "xpath=//div[@id='login-panel-new']"
+        """Ask Douyin to show login only if it is not already on screen."""
+        dialog = self.context_page.locator("#login-panel-new")
         try:
-            # check dialog box is auto popup and wait for 10 seconds
-            await self.context_page.wait_for_selector(dialog_selector, timeout=1000 * 10)
-        except Exception as e:
-            utils.logger.error(f"[DouYinLogin.popup_login_dialog] login dialog box does not pop up automatically, error: {e}")
-            utils.logger.info("[DouYinLogin.popup_login_dialog] login dialog box does not pop up automatically, we will manually click the login button")
-            login_button_ele = self.context_page.locator("xpath=//p[text() = '登录']")
-            await login_button_ele.click()
-            await asyncio.sleep(0.5)
+            if await dialog.is_visible(timeout=2000):
+                return
+            if await dialog.count():
+                utils.logger.info(
+                    "[DouYinLogin.popup_login_dialog] 登录框在页面里但是隐藏的，先不点登录。"
+                )
+                return
+        except Exception:
+            pass
+        login_button = self.context_page.locator("xpath=//p[text() = '登录']").first
+        try:
+            if await login_button.is_visible(timeout=1500):
+                await login_button.click(timeout=2500)
+                await asyncio.sleep(0.4)
+                return
+        except Exception:
+            pass
+        utils.logger.info("[DouYinLogin.begin] 登录框没自动弹出，请在 Chrome 窗口里自己点登录。")
 
     async def login_by_qrcode(self):
         utils.logger.info("[DouYinLogin.login_by_qrcode] Begin login douyin by qrcode...")

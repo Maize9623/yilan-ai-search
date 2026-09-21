@@ -65,15 +65,14 @@ class BaiduTieBaLogin(AbstractLogin):
 
     async def begin(self):
         """Start login baidutieba"""
-        utils.logger.info("[BaiduTieBaLogin.begin] Begin login baidutieba ...")
-        if config.LOGIN_TYPE == "qrcode":
-            await self.login_by_qrcode()
-        elif config.LOGIN_TYPE == "phone":
-            await self.login_by_mobile()
-        elif config.LOGIN_TYPE == "cookie":
-            await self.login_by_cookies()
-        else:
-            raise ValueError("[BaiduTieBaLogin.begin]Invalid Login Type Currently only supported qrcode or phone or cookies ...")
+        from tools.login_ready import complete_login_if_needed
+
+        await complete_login_if_needed(
+            self.browser_context,
+            self.context_page,
+            "tieba",
+            cookie_login=self.login_by_cookies,
+        )
 
     async def login_by_mobile(self):
         """Login baidutieba by mobile"""

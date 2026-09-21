@@ -225,7 +225,10 @@ class ZhiHuClient(AbstractApiClient, ProxyRefreshMixin):
             "vertical": note_type.value,
         }
         search_res = await self.get(uri, params)
-        utils.logger.info(f"[ZhiHuClient.get_note_by_keyword] Search result: {search_res}")
+        rows = (search_res or {}).get("data") if isinstance(search_res, dict) else None
+        utils.logger.info(
+            f"[ZhiHuClient.get_note_by_keyword] Search result n={len(rows or [])}"
+        )
         return self._extractor.extract_contents_from_search(search_res)
 
     async def get_root_comments(

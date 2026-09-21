@@ -19,6 +19,7 @@
 
 import asyncio
 import json
+import time
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
 from urllib.parse import quote, urlencode
 
@@ -46,11 +47,33 @@ from .exception import (
     IPBlockError,
     NoteNotFoundError,
     PlatformAccessError,
+    VerifyBlocked,
 )
 from .field import SearchNoteType, SearchSortType
 from .help import get_search_id
 from .extractor import XiaoHongShuExtractor
 from .playwright_sign import sign_with_xhshow
+
+
+def selfinfo_looks_logged_in(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    result = data.get("result") if isinstance(data.get("result"), dict) else {}
+    if result.get("success") is True:
+        return True
+    basic = data.get("basic_info") if isinstance(data.get("basic_info"), dict) else {}
+    user_id = (
+        data.get("user_id")
+        or data.get("userid")
+        or data.get("userId")
+        or data.get("red_id")
+        or basic.get("red_id")
+    )
+    nickname = data.get("nickname") or basic.get("nickname")
+    if user_id:
+        return True
+    return payload.get("success") is True and bool(nickname)
 
 
 class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
@@ -83,6 +106,11 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
         self.NOTE_ABNORMAL_CODE = -510001
         self.playwright_page = playwright_page
         self.cookie_dict = cookie_dict
+        self.verify_blocked = False
+        self.detail_api_blocked = False
+        self._verify_lock = asyncio.Lock()
+        self._page_read_lock = asyncio.Lock()
+        self._verify_hint_url = ""
         self._extractor = XiaoHongShuExtractor()
         # Initialize proxy pool (from ProxyRefreshMixin)
         self.init_proxy_pool(proxy_ip_pool)
@@ -124,11 +152,176 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
         self.headers.update(headers)
         return self.headers
 
+    async def _send(self, method, url, **kwargs):
+        await self._refresh_proxy_if_expired()
+        async with make_async_client(proxy=self.proxy) as client:
+            return await client.request(method, url, timeout=self.timeout, **kwargs)
+
+    async def _page_has_visible_verify(self) -> bool:
+        page = self.playwright_page
+        if page is None or not hasattr(page, "evaluate"):
+            return False
+        from tools.login_ready import page_needs_verify
+
+        try:
+            return await page_needs_verify(page) is True
+        except Exception:
+            return False
+
+    async def _restore_if_verify(self) -> bool:
+        if not await self._page_has_visible_verify():
+            return False
+        page = self.playwright_page
+        if page is None:
+            return True
+        try:
+            from tools.chrome_launch import restore_crawler_window
+
+            await restore_crawler_window(page)
+        except Exception:
+            pass
+        return True
+
+    async def _settle_if_idle(self) -> None:
+        page = self.playwright_page
+        if page is None:
+            return
+        try:
+            from tools.chrome_launch import settle_if_idle
+
+            await settle_if_idle(page, "小红书")
+        except Exception:
+            pass
+
+    async def _offer_visible_verify(self, url: str) -> bool:
+        page = self.playwright_page
+        if page is None or not hasattr(page, "evaluate"):
+            return False
+        if await self._restore_if_verify():
+            return True
+        hint = str(getattr(self, "_verify_hint_url", "") or "")
+        target = ""
+        if isinstance(url, str) and "/explore/" in url and url.startswith("http"):
+            target = url.split("#")[0]
+        elif hint.startswith("http"):
+            target = hint
+        if target:
+            try:
+                await page.goto(target, wait_until="domcontentloaded", timeout=15000)
+            except Exception:
+                pass
+            if await self._restore_if_verify():
+                return True
+        return False
+
+    async def _page_note_state(self):
+        page = self.playwright_page
+        if page is None or not hasattr(page, "evaluate"):
+            return None
+        try:
+            return await page.evaluate("() => window.__INITIAL_STATE__ || null")
+        except Exception:
+            return None
+
+    async def _page_has_open_note(self, note_id: str = "") -> bool:
+        if await self._page_has_visible_verify():
+            return False
+        state = await self._page_note_state()
+        if note_id and self._extractor.pick_note_from_state(state, note_id):
+            return True
+        if isinstance(state, dict) and isinstance(state.get("note"), dict):
+            return True
+        page = self.playwright_page
+        url = str(getattr(page, "url", "") or "")
+        return "/explore/" in url and len(url.split("/explore/")[-1].split("?")[0]) > 8
+
+    async def _bring_crawler_if_asked(self) -> None:
+        from tools.login_ready import consume_show_crawler
+
+        if not consume_show_crawler():
+            return
+        page = self.playwright_page
+        if page is None or not hasattr(page, "bring_to_front"):
+            return
+        try:
+            from tools.chrome_launch import restore_crawler_window
+
+            await restore_crawler_window(page)
+        except Exception:
+            pass
+        try:
+            from tools.board_preview import take_still
+
+            await take_still(page.context)
+        except Exception:
+            pass
+
+    async def _wait_out_verify(self, method, url, **kwargs):
+        from tools.login_ready import (
+            LOGIN_WAIT_SECONDS,
+            SILENT_VERIFY_SECONDS,
+            consume_search_continue,
+        )
+
+        page = self.playwright_page
+        visible = await self._offer_visible_verify(url)
+        if not visible and await self._page_has_open_note():
+            self.detail_api_blocked = True
+            utils.logger.info(
+                "[XiaoHongShuClient.request] 详情页已经打开，页面上没有安全验证。"
+                "取详情的接口仍被风控，改从页面收正文。"
+            )
+            raise VerifyBlocked("小红书详情改从页面收")
+        if not visible:
+            utils.logger.info(
+                "[XiaoHongShuClient.request] 取详情的接口被风控挡住了。"
+                "页面上没有验证弹窗。首页看起来正常也正常，先再试几下；还不行就收下搜索列表。"
+            )
+        started = time.monotonic()
+        deadline = started + (LOGIN_WAIT_SECONDS if visible else SILENT_VERIFY_SECONDS)
+        last_beat = 0.0
+        while time.monotonic() < deadline:
+            await self._bring_crawler_if_asked()
+            poked = consume_search_continue("xhs")
+            if not poked:
+                await asyncio.sleep(1)
+                poked = consume_search_continue("xhs")
+            await self._bring_crawler_if_asked()
+            if page is not None and hasattr(page, "context"):
+                try:
+                    await self.update_cookies(page.context)
+                except Exception:
+                    pass
+            if not visible:
+                visible = await self._restore_if_verify()
+                if visible:
+                    deadline = time.monotonic() + LOGIN_WAIT_SECONDS
+                    utils.logger.info(
+                        "[XiaoHongShuClient.request] 爬虫窗口里出现了安全验证。过完会自动再取。"
+                    )
+            elapsed = time.monotonic() - started
+            if poked or elapsed - last_beat >= 12 or last_beat == 0:
+                last_beat = elapsed
+                if poked:
+                    msg = "收到接着搜，马上再取小红书。"
+                elif visible:
+                    msg = "还在等你过小红书安全验证。看爬虫那扇 Chrome，不是日常开着的首页。"
+                else:
+                    msg = "取详情仍被风控挡住，页面上没有验证弹窗。先再试，还不行就收下搜索列表。"
+                utils.logger.info("[XiaoHongShuClient.request] " + msg)
+            response = await self._send(method, url, **kwargs)
+            if response.status_code not in {461, 471}:
+                self.verify_blocked = False
+                await self._settle_if_idle()
+                return response
+        self.verify_blocked = True
+        raise VerifyBlocked("小红书接口仍被验证挡住")
+
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_fixed(1),
         retry=retry_if_not_exception_type(
-            (NoteNotFoundError, IPBlockError, PlatformAccessError)
+            (NoteNotFoundError, IPBlockError, PlatformAccessError, VerifyBlocked)
         ),
     )
     async def request(self, method, url, **kwargs) -> Union[str, Any]:
@@ -142,13 +335,9 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
         Returns:
 
         """
-        # Check if proxy is expired before each request
-        await self._refresh_proxy_if_expired()
-
-        # return response.text
         return_response = kwargs.pop("return_response", False)
-        async with make_async_client(proxy=self.proxy) as client:
-            response = await client.request(method, url, timeout=self.timeout, **kwargs)
+        kwargs.pop("_verify_tries", None)
+        response = await self._send(method, url, **kwargs)
 
         if response.status_code in {401, 403, 429}:
             raise PlatformAccessError(
@@ -156,12 +345,23 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
             )
 
         if response.status_code == 471 or response.status_code == 461:
-            # someday someone maybe will bypass captcha
-            verify_type = response.headers["Verifytype"]
-            verify_uuid = response.headers["Verifyuuid"]
-            msg = f"CAPTCHA appeared, request failed, Verifytype: {verify_type}, Verifyuuid: {verify_uuid}, Response: {response}"
-            utils.logger.error(msg)
-            raise Exception(msg)
+            verify_type = response.headers.get("Verifytype", "")
+            verify_uuid = response.headers.get("Verifyuuid", "")
+            utils.logger.info(
+                f"[XiaoHongShuClient.request] 取详情接口被风控挡住了"
+                f"（HTTP {response.status_code} Verifytype={verify_type} Verifyuuid={verify_uuid}）。"
+                "页面上如果已经是详情、没有滑块，就从页面收，不用过验证。"
+            )
+            if self.detail_api_blocked or self.verify_blocked:
+                raise VerifyBlocked("小红书详情改从页面收")
+            async with self._verify_lock:
+                if self.detail_api_blocked or self.verify_blocked:
+                    raise VerifyBlocked("小红书详情改从页面收")
+                retry = await self._send(method, url, **kwargs)
+                if retry.status_code not in {461, 471}:
+                    response = retry
+                else:
+                    response = await self._wait_out_verify(method, url, **kwargs)
 
         response_data: Optional[Dict] = None
         try:
@@ -283,6 +483,26 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
                 return response.json()
         return None
 
+    async def _sync_browser_cookies(self) -> None:
+        page = self.playwright_page
+        if page is None or not hasattr(page, "context"):
+            return
+        try:
+            await self.update_cookies(page.context)
+        except Exception:
+            pass
+
+    async def _page_looks_logged_in(self) -> bool:
+        page = self.playwright_page
+        if page is None or not hasattr(page, "context"):
+            return False
+        try:
+            from tools.login_ready import already_logged_in
+
+            return await already_logged_in(page.context, page, "xhs")
+        except Exception:
+            return False
+
     async def pong(self) -> bool:
         """
         Check if login state is still valid by querying self user info
@@ -290,17 +510,20 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
             bool: True if logged in, False otherwise
         """
         utils.logger.info("[XiaoHongShuClient.pong] Begin to check login state...")
+        await self._sync_browser_cookies()
         ping_flag = False
         try:
             self_info: Dict = await self.query_self()
-            if self_info and self_info.get("data", {}).get("result", {}).get("success"):
-                ping_flag = True
+            ping_flag = selfinfo_looks_logged_in(self_info)
         except Exception as e:
             utils.logger.error(
                 f"[XiaoHongShuClient.pong] Check login state failed: {e}, and try to login again..."
             )
             ping_flag = False
-        utils.logger.info(f"[XiaoHongShuClient.pong] Login state result: {ping_flag}")
+        if not ping_flag:
+            ping_flag = await self._page_looks_logged_in()
+        if ping_flag:
+            utils.logger.info("[XiaoHongShuClient.pong] Login state result: True")
         return ping_flag
 
     async def update_cookies(self, browser_context: BrowserContext, urls: Optional[list[str]] = None):
@@ -369,6 +592,11 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
         """
         if xsec_source == "":
             xsec_source = "pc_search"
+        self._verify_hint_url = f"{self._domain}/explore/{note_id}"
+        if xsec_token:
+            self._verify_hint_url += f"?xsec_token={xsec_token}&xsec_source={xsec_source}"
+        if self.detail_api_blocked:
+            raise VerifyBlocked("小红书详情改从页面收")
 
         data = {
             "source_note_id": note_id,
@@ -387,6 +615,56 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
             f"[XiaoHongShuClient.get_note_by_id] get note id:{note_id} empty and res:{res}"
         )
         return dict()
+
+    async def get_note_by_id_from_page(
+        self,
+        note_id: str,
+        xsec_source: str,
+        xsec_token: str,
+    ) -> Optional[Dict]:
+        page = self.playwright_page
+        if page is None or not hasattr(page, "goto"):
+            return None
+        if xsec_source == "":
+            xsec_source = "pc_search"
+        url = (
+            f"{self._domain}/explore/{note_id}"
+            f"?xsec_token={xsec_token}&xsec_source={xsec_source}"
+        )
+        async with self._page_read_lock:
+            if await self._restore_if_verify():
+                return None
+            current = str(getattr(page, "url", "") or "")
+            if note_id not in current:
+                try:
+                    await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+                except Exception:
+                    return None
+                if hasattr(page, "wait_for_function"):
+                    try:
+                        await page.wait_for_function(
+                            "() => window.__INITIAL_STATE__ && window.__INITIAL_STATE__.note",
+                            timeout=8000,
+                        )
+                    except Exception:
+                        pass
+            if await self._restore_if_verify():
+                return None
+            note = self._extractor.pick_note_from_state(
+                await self._page_note_state(), note_id
+            )
+            if not note:
+                try:
+                    html = await page.content()
+                except Exception:
+                    html = ""
+                if html:
+                    note = self._extractor.extract_note_detail_from_html(note_id, html)
+            if note:
+                utils.logger.info(
+                    f"[XiaoHongShuClient.get_note_by_id_from_page] 已从页面收下 {note_id}"
+                )
+            return note
 
     async def get_note_comments(
         self,

@@ -105,15 +105,16 @@ class TieBaDbStoreImplement(AbstractStore):
             content_item: content item dict
         """
         note_id = content_item.get("note_id")
+        payload = {key: value for key, value in content_item.items() if key != "image_list"}
         async with get_session() as session:
             stmt = select(TiebaNote).where(TiebaNote.note_id == note_id)
             res = await session.execute(stmt)
             db_note = res.scalar_one_or_none()
             if db_note:
-                for key, value in content_item.items():
+                for key, value in payload.items():
                     setattr(db_note, key, value)
             else:
-                db_note = TiebaNote(**content_item)
+                db_note = TiebaNote(**payload)
                 session.add(db_note)
             await session.commit()
 

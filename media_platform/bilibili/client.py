@@ -41,6 +41,8 @@ if TYPE_CHECKING:
 
 from .exception import DataFetchError
 from .field import CommentOrderType, SearchOrderType
+from tools.video_read import pick_subtitle_track, subtitle_body_text
+
 from .help import BilibiliSign
 
 
@@ -212,6 +214,86 @@ class BilibiliClient(AbstractApiClient, ProxyRefreshMixin):
         else:
             params.update({"bvid": bvid})
         return await self.get(uri, params, enable_params_sign=False)
+
+    async def get_player_info(self, aid: int, cid: int) -> Dict:
+        if not aid or not cid:
+            return {}
+        return await self.get(
+            "/x/player/wbi/v2",
+            {"aid": int(aid), "cid": int(cid)},
+            enable_params_sign=True,
+        )
+
+    async def get_absolute_json(self, url: str) -> Any:
+        await self._refresh_proxy_if_expired()
+        headers = {
+            **self.headers,
+            "Referer": "https://www.bilibili.com",
+            "Origin": "https://www.bilibili.com",
+        }
+        async with make_async_client(proxy=self.proxy, follow_redirects=True) as client:
+            response = await client.request("GET", url, timeout=self.timeout, headers=headers)
+        if response.status_code >= 400:
+            raise DataFetchError(f"subtitle http {response.status_code}")
+        try:
+            return response.json()
+        except json.JSONDecodeError as error:
+            raise DataFetchError(f"subtitle json: {error}") from error
+
+    def _subtitle_tracks_from(self, payload: Any) -> List[Dict]:
+        if not isinstance(payload, dict):
+            return []
+        subtitle = payload.get("subtitle")
+        if isinstance(subtitle, dict):
+            rows = subtitle.get("list") or subtitle.get("subtitles") or []
+        elif isinstance(payload.get("subtitles"), list):
+            rows = payload.get("subtitles")
+        else:
+            rows = []
+        return [row for row in rows if isinstance(row, dict)]
+
+    async def fetch_subtitle_tracks(self, video_view: Dict) -> List[Dict]:
+        tracks = self._subtitle_tracks_from(video_view)
+        if tracks:
+            return tracks
+        aid = video_view.get("aid")
+        cid = video_view.get("cid")
+        if not cid:
+            pages = video_view.get("pages") or []
+            if pages and isinstance(pages[0], dict):
+                cid = pages[0].get("cid")
+        if not aid or not cid:
+            return []
+        try:
+            player = await self.get_player_info(int(aid), int(cid))
+        except Exception as error:
+            utils.logger.info(f"[BilibiliClient.fetch_subtitle_tracks] player miss: {error}")
+            return []
+        return self._subtitle_tracks_from(player)
+
+    async def get_spoken_text(self, video_view: Dict) -> Tuple[str, str]:
+        desc = str((video_view or {}).get("desc") or "").strip()
+        try:
+            tracks = await self.fetch_subtitle_tracks(video_view or {})
+        except Exception as error:
+            utils.logger.info(f"[BilibiliClient.get_spoken_text] tracks miss: {error}")
+            tracks = []
+        track = pick_subtitle_track(tracks)
+        if not track:
+            return desc, "desc" if desc else "none"
+        url = str(track.get("subtitle_url") or track.get("subtitle_url_v2") or "").strip()
+        if url.startswith("//"):
+            url = "https:" + url
+        if not url:
+            return desc, "desc" if desc else "none"
+        try:
+            text = subtitle_body_text(await self.get_absolute_json(url))
+        except Exception as error:
+            utils.logger.info(f"[BilibiliClient.get_spoken_text] subtitle miss: {error}")
+            text = ""
+        if text:
+            return text, "subtitle"
+        return desc, "desc" if desc else "none"
 
     async def get_video_play_url(self, aid: int, cid: int) -> Dict:
         """

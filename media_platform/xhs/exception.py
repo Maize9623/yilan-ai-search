@@ -25,6 +25,10 @@ class DataFetchError(RequestError):
     """something error when fetch"""
 
 
+class VerifyBlocked(DataFetchError):
+    """Xiaohongshu asked the user to pass a visible login/verify gate."""
+
+
 class IPBlockError(RequestError):
     """fetch so fast that the server block us ip"""
 

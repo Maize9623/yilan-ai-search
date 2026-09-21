@@ -56,7 +56,9 @@ SAVE_LOGIN_STATE = True
 # 是否启用 CDP 模式 - 使用用户本地的 Chrome/Edge 浏览器进行爬取，具有更好的反检测能力
 # 开启后，会自动检测并启动用户的 Chrome/Edge 浏览器，通过 CDP 协议进行控制
 # 该方式使用真实浏览器环境，包括用户的扩展、Cookie 和设置，大幅降低被风控检测的风险
-ENABLE_CDP_MODE = True
+# 看板走本机 Chrome 的持久化配置目录，不连已打开的调试 Chrome。
+# Chrome 152 的 connect_over_cdp 会秒失败，再退回未安装的 Chrome for Testing。
+ENABLE_CDP_MODE = False
 
 # CDP 调试端口，用于与浏览器通信
 # 如果端口被占用，系统会自动尝试下一个可用端口
@@ -83,8 +85,8 @@ BROWSER_LAUNCH_TIMEOUT = 60
 CDP_CONNECT_EXISTING = True
 
 # 程序结束时是否自动关闭浏览器
-# 设置为 False 可以保持浏览器运行，方便调试
-AUTO_CLOSE_BROWSER = True
+# 跨平台连续搜索时必须保持浏览器开着，否则第一站结束后后面都会连不上
+AUTO_CLOSE_BROWSER = False
 
 # Data saving type option configuration, supports: csv, db, json, jsonl, sqlite, excel, postgres. It is best to save to DB, with deduplication function.
 SAVE_DATA_OPTION = "jsonl"  # csv or db or json or jsonl or sqlite or excel or postgres

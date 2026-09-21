@@ -20,6 +20,7 @@
 
 # -*- coding: utf-8 -*-
 import json
+import re
 from typing import Dict, List, Optional
 from urllib.parse import parse_qs, urlparse
 
@@ -30,9 +31,70 @@ from constant import zhihu as zhihu_constant
 from model.m_zhihu import ZhihuComment, ZhihuContent, ZhihuCreator
 from tools import utils
 from tools.crawler_util import extract_text_from_html
-from tools.user_hash import anonymize_user_id, mask_nickname
+from tools.user_hash import anonymize_user_id, store_nickname
 
 ZHIHU_SGIN_JS = None
+_ZHIHU_IMG_SKIP = ("emoji", "emoticon", "static", "avatar", "icon")
+_ZHIHU_PIC_ID = re.compile(r"(v2-[0-9a-fA-F]+)")
+
+
+def fold_related_images(urls: List[str]) -> List[str]:
+    """Keep one file per Zhihu image id; prefer the wide still over `_r` copies."""
+
+    def rank(url: str) -> int:
+        low = url.lower()
+        if "_1440w" in low:
+            return 0
+        if "_r." in low:
+            return 2
+        return 1
+
+    best: dict[str, str] = {}
+    order: list[str] = []
+    for url in urls:
+        found = _ZHIHU_PIC_ID.search(url)
+        key = found.group(1) if found else url
+        prev = best.get(key)
+        if prev is None:
+            best[key] = url
+            order.append(key)
+            continue
+        if rank(url) < rank(prev):
+            best[key] = url
+    return [best[key] for key in order]
+
+
+def search_keywords(raw: str) -> List[str]:
+    text = " ".join((raw or "").strip().split())
+    if not text:
+        return []
+    if "," in text:
+        parts = [part.strip() for part in text.split(",") if part.strip()]
+        if len(parts) > 1 and all(len(part) <= 16 and " " not in part for part in parts):
+            return parts
+    return [text]
+
+
+def html_pic_urls(raw_html: str) -> List[str]:
+    urls: List[str] = []
+    for src in re.findall(
+        r'(?:data-original|data-actualsrc|data-src|src)=["\']([^"\']+)["\']',
+        raw_html or "",
+        flags=re.I,
+    ):
+        clean = src.strip()
+        if clean.startswith("//"):
+            clean = "https:" + clean
+        if not clean.startswith("http"):
+            continue
+        low = clean.lower()
+        if any(token in low for token in _ZHIHU_IMG_SKIP):
+            continue
+        if not any(host in low for host in ("zhimg.com", "sinaimg", "zhihu.com")):
+            continue
+        if clean not in urls:
+            urls.append(clean)
+    return fold_related_images(urls)[:8]
 
 
 def sign(url: str, cookies: str) -> Dict:
@@ -109,10 +171,19 @@ class ZhihuExtractor:
         res = ZhihuContent()
         res.content_id = str(answer.get("id") or "")
         res.content_type = answer.get("type")
-        res.content_text = extract_text_from_html(answer.get("content", ""))
-        res.question_id = str(answer.get("question", {}).get("id") or "")
+        raw_html = answer.get("content", "") or ""
+        res.content_text = extract_text_from_html(raw_html)
+        if not res.content_text:
+            res.content_text = extract_text_from_html(
+                answer.get("excerpt") or answer.get("description") or ""
+            )
+        res.image_list = ",".join(html_pic_urls(raw_html))
+        question = answer.get("question") or {}
+        res.question_id = str(question.get("id") or "")
         res.content_url = f"{zhihu_constant.ZHIHU_URL}/question/{res.question_id}/answer/{res.content_id}"
-        res.title = extract_text_from_html(answer.get("title", ""))
+        res.title = extract_text_from_html(
+            answer.get("title") or question.get("title") or ""
+        )
         res.desc = extract_text_from_html(answer.get("description", "") or answer.get("excerpt", ""))
         res.created_time = answer.get("created_time")
         res.updated_time = answer.get("updated_time")
@@ -137,7 +208,11 @@ class ZhihuExtractor:
         res = ZhihuContent()
         res.content_id = str(article.get("id") or "")
         res.content_type = article.get("type")
-        res.content_text = extract_text_from_html(article.get("content"))
+        raw_html = article.get("content") or ""
+        res.content_text = extract_text_from_html(raw_html)
+        if not res.content_text:
+            res.content_text = extract_text_from_html(article.get("excerpt") or "")
+        res.image_list = ",".join(html_pic_urls(raw_html))
         res.content_url = f"{zhihu_constant.ZHIHU_ZHUANLAN_URL}/p/{res.content_id}"
         res.title = extract_text_from_html(article.get("title"))
         res.desc = extract_text_from_html(article.get("excerpt"))
@@ -174,6 +249,10 @@ class ZhihuExtractor:
             res.created_time = zvideo.get("created_at")
         res.title = extract_text_from_html(zvideo.get("title"))
         res.desc = extract_text_from_html(zvideo.get("description"))
+        res.content_text = res.desc
+        video = zvideo.get("video") if isinstance(zvideo.get("video"), dict) else {}
+        thumb = zvideo.get("image_url") or zvideo.get("thumbnail") or video.get("thumbnail") or ""
+        res.image_list = thumb if isinstance(thumb, str) and thumb.startswith("http") else ""
         res.voteup_count = zvideo.get("voteup_count")
         res.comment_count = zvideo.get("comment_count")
 
@@ -200,7 +279,7 @@ class ZhihuExtractor:
             if not author.get("id"):
                 author = author.get("member")
             res.creator_hash = anonymize_user_id(author.get("id"))
-            res.user_nickname = mask_nickname(author.get("name"))
+            res.user_nickname = store_nickname(author.get("name"))
 
         except Exception as e :
             utils.logger.warning(
@@ -339,7 +418,7 @@ class ZhihuExtractor:
 
         res = ZhihuCreator()
         res.creator_hash = anonymize_user_id(creator_info.get("id"))
-        res.user_nickname = mask_nickname(creator_info.get("name"))
+        res.user_nickname = store_nickname(creator_info.get("name"))
         res.follows = creator_info.get("followingCount")
         res.fans = creator_info.get("followerCount")
         res.anwser_count = creator_info.get("answerCount")

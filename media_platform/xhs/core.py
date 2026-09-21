@@ -22,7 +22,6 @@ import os
 import random
 from asyncio import Task
 from typing import Dict, List, Optional
-
 from playwright.async_api import (
     BrowserContext,
     BrowserType,
@@ -38,7 +37,10 @@ from model.m_xiaohongshu import NoteUrlInfo, CreatorUrlInfo
 from proxy.proxy_ip_pool import IpInfoModel, create_ip_pool
 from store import xhs as xhs_store
 from tools import utils
+from tools.search_ladders import mark_ladder_done, need_more, query_steps
 from tools.cdp_browser import CDPBrowserManager
+from tools.chrome_launch import adopt_page, launch_persistent_chrome, settle_if_idle
+from tools.user_hash import pick_fans
 from var import crawler_type_var, source_keyword_var
 
 from .client import XiaoHongShuClient
@@ -47,9 +49,15 @@ from .exception import (
     IPBlockError,
     NoteNotFoundError,
     PlatformAccessError,
+    VerifyBlocked,
 )
 from .field import SearchSortType
-from .help import parse_note_info_from_note_url, parse_creator_info_from_url, get_search_id
+from .help import (
+    get_search_id,
+    note_from_search_item,
+    parse_creator_info_from_url,
+    parse_note_info_from_note_url,
+)
 from .login import XiaoHongShuLogin
 
 
@@ -66,6 +74,10 @@ class XiaoHongShuCrawler(AbstractCrawler):
         self.user_agent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
         self.cdp_manager = None
         self.ip_proxy_pool = None  # Proxy IP pool for automatic proxy refresh
+        self._board_fans: Dict[str, str] = {}
+
+    async def _settle_unless_verify(self) -> None:
+        await settle_if_idle(self.context_page, "小红书")
 
     async def start(self) -> None:
         playwright_proxy_format, httpx_proxy_format = None, None
@@ -97,8 +109,15 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 # stealth.min.js is a js script to prevent the website from detecting the crawler.
                 await self.browser_context.add_init_script(path="libs/stealth.min.js")
 
-            self.context_page = await self.browser_context.new_page()
-            await self.context_page.goto(self.index_url)
+            self.context_page = await adopt_page(self.browser_context)
+            try:
+                await self.context_page.goto(
+                    self.index_url, wait_until="domcontentloaded", timeout=20000
+                )
+            except Exception as error:
+                utils.logger.info(
+                    f"[XiaoHongShuCrawler.start] 小红书首页没完全加载完：{error}，窗口先留着。"
+                )
 
             # Create a client to interact with the Xiaohongshu website.
             self.xhs_client = await self.create_xhs_client(httpx_proxy_format)
@@ -110,16 +129,18 @@ class XiaoHongShuCrawler(AbstractCrawler):
                     context_page=self.context_page,
                     cookie_str=config.COOKIES,
                 )
-                await login_obj.begin()
+                await login_obj.begin(ready=self.xhs_client.pong)
                 await self.xhs_client.update_cookies(
                     browser_context=self.browser_context,
                     urls=self.cookie_urls,
                 )
 
+            await self._settle_unless_verify()
             crawler_type_var.set(config.CRAWLER_TYPE)
             if config.CRAWLER_TYPE == "search":
                 # Search for notes and retrieve their comment information.
                 await self.search()
+                await self._settle_unless_verify()
             elif config.CRAWLER_TYPE == "detail":
                 # Get the information and comments of the specified post
                 await self.get_specified_notes()
@@ -134,61 +155,147 @@ class XiaoHongShuCrawler(AbstractCrawler):
     async def search(self) -> None:
         """Search for notes and retrieve their comment information."""
         utils.logger.info("[XiaoHongShuCrawler.search] Begin search Xiaohongshu keywords")
-        xhs_limit_count = 20  # Xiaohongshu limit page fixed value
-        if config.CRAWLER_MAX_NOTES_COUNT < xhs_limit_count:
-            config.CRAWLER_MAX_NOTES_COUNT = xhs_limit_count
+        wanted_notes = max(1, int(config.CRAWLER_MAX_NOTES_COUNT))
         start_page = config.START_PAGE
-        for keyword in config.KEYWORDS.split(","):
-            source_keyword_var.set(keyword)
-            utils.logger.info(f"[XiaoHongShuCrawler.search] Current search keyword: {keyword}")
-            page = 1
-            search_id = get_search_id()
-            while (page - start_page + 1) * xhs_limit_count <= config.CRAWLER_MAX_NOTES_COUNT:
-                if page < start_page:
-                    utils.logger.info(f"[XiaoHongShuCrawler.search] Skip page {page}")
-                    page += 1
-                    continue
+        for seed in config.KEYWORDS.split(","):
+            seed = seed.strip()
+            if not seed:
+                continue
+            written = 0
+            seen_ids: set[str] = set()
+            for step_i, (step_name, keyword) in enumerate(query_steps(seed)):
+                if written >= wanted_notes:
+                    break
+                if step_i and not need_more(written, wanted_notes):
+                    break
+                source_keyword_var.set(keyword)
+                utils.logger.info(
+                    f"[XiaoHongShuCrawler.search] 策略{step_i + 1} {step_name}：{keyword}"
+                )
+                page = 1
+                search_id = get_search_id()
+                added = written
+                while written < wanted_notes and page <= start_page + 5:
+                    if page < start_page:
+                        utils.logger.info(f"[XiaoHongShuCrawler.search] Skip page {page}")
+                        page += 1
+                        continue
 
-                try:
-                    utils.logger.info(f"[XiaoHongShuCrawler.search] search Xiaohongshu keyword: {keyword}, page: {page}")
-                    note_ids: List[str] = []
-                    xsec_tokens: List[str] = []
-                    notes_res = await self.xhs_client.get_note_by_keyword(
-                        keyword=keyword,
-                        search_id=search_id,
-                        page=page,
-                        sort=(SearchSortType(config.SORT_TYPE) if config.SORT_TYPE != "" else SearchSortType.GENERAL),
-                    )
-                    utils.logger.info(f"[XiaoHongShuCrawler.search] Search notes response: {notes_res}")
-                    if not notes_res or not notes_res.get("has_more", False):
-                        utils.logger.info("[XiaoHongShuCrawler.search] No more content!")
-                        break
-                    semaphore = asyncio.Semaphore(config.MAX_CONCURRENCY_NUM)
-                    task_list = [
-                        self.get_note_detail_async_task(
-                            note_id=post_item.get("id"),
-                            xsec_source=post_item.get("xsec_source"),
-                            xsec_token=post_item.get("xsec_token"),
-                            semaphore=semaphore,
-                        ) for post_item in notes_res.get("items", {}) if post_item.get("model_type") not in ("rec_query", "hot_query")
-                    ]
-                    note_details = await asyncio.gather(*task_list)
-                    for note_detail in note_details:
-                        if note_detail:
+                    try:
+                        utils.logger.info(f"[XiaoHongShuCrawler.search] search Xiaohongshu keyword: {keyword}, page: {page}")
+                        note_ids: List[str] = []
+                        xsec_tokens: List[str] = []
+                        notes_res = await self.xhs_client.get_note_by_keyword(
+                            keyword=keyword,
+                            search_id=search_id,
+                            page=page,
+                            sort=(SearchSortType(config.SORT_TYPE) if config.SORT_TYPE != "" else SearchSortType.GENERAL),
+                        )
+                        item_count = len(notes_res.get("items", [])) if isinstance(notes_res, dict) else 0
+                        utils.logger.info(
+                            f"[XiaoHongShuCrawler.search] Search notes response: {item_count} items"
+                        )
+                        if not notes_res:
+                            utils.logger.info("[XiaoHongShuCrawler.search] No more content!")
+                            break
+                        semaphore = asyncio.Semaphore(config.MAX_CONCURRENCY_NUM)
+                        remain = wanted_notes - written
+                        posts = [
+                            post_item
+                            for post_item in notes_res.get("items", [])
+                            if post_item.get("model_type") not in ("rec_query", "hot_query")
+                            and post_item.get("id") not in seen_ids
+                        ][:remain]
+                        if not posts:
+                            utils.logger.info("[XiaoHongShuCrawler.search] No more content!")
+                            break
+                        for post_item in posts:
+                            note_id = post_item.get("id")
+                            if note_id:
+                                seen_ids.add(note_id)
+                        utils.logger.info(
+                            f"[XiaoHongShuCrawler.search] 本页取 {len(posts)} 条详情，目标 {wanted_notes}，已有 {written}"
+                        )
+                        task_list = [
+                            asyncio.create_task(
+                                self.get_note_detail_async_task(
+                                    note_id=post_item.get("id"),
+                                    xsec_source=post_item.get("xsec_source"),
+                                    xsec_token=post_item.get("xsec_token"),
+                                    semaphore=semaphore,
+                                )
+                            )
+                            for post_item in posts
+                        ]
+                        got_ids: set[str] = set()
+                        for finished in asyncio.as_completed(task_list):
+                            try:
+                                note_detail = await finished
+                            except asyncio.CancelledError:
+                                continue
+                            if getattr(self.xhs_client, "verify_blocked", False):
+                                for task in task_list:
+                                    if not task.done():
+                                        task.cancel()
+                            if not note_detail:
+                                continue
                             await xhs_store.update_xhs_note(note_detail)
                             await self.get_notice_media(note_detail)
                             note_ids.append(note_detail.get("note_id"))
                             xsec_tokens.append(note_detail.get("xsec_token"))
-                    page += 1
-                    utils.logger.info(f"[XiaoHongShuCrawler.search] Note details: {note_details}")
-                    await self.batch_get_note_comments(note_ids, xsec_tokens)
+                            got_ids.add(str(note_detail.get("note_id") or ""))
+                            written += 1
+                            if written == 1:
+                                await self._settle_unless_verify()
+                            utils.logger.info(
+                                f"[XiaoHongShuCrawler.search] 已写下第 {written} 条"
+                            )
+                        if task_list:
+                            await asyncio.gather(*task_list, return_exceptions=True)
+                        for post_item in posts:
+                            fallback = note_from_search_item(post_item)
+                            if not fallback or fallback["note_id"] in got_ids:
+                                continue
+                            try:
+                                await xhs_store.update_xhs_note(fallback)
+                            except Exception as error:
+                                utils.logger.error(
+                                    f"[XiaoHongShuCrawler.search] 搜索列表第 {fallback['note_id']} 条没写下：{error}"
+                                )
+                                continue
+                            got_ids.add(fallback["note_id"])
+                            written += 1
+                            if written == 1:
+                                await self._settle_unless_verify()
+                            utils.logger.info(
+                                f"[XiaoHongShuCrawler.search] 详情被拦，先收下搜索列表第 {written} 条"
+                            )
+                        page += 1
+                        utils.logger.info(
+                            f"[XiaoHongShuCrawler.search] Note details written: {written}/{wanted_notes}"
+                        )
+                        await self.batch_get_note_comments(note_ids, xsec_tokens)
+                        if written >= wanted_notes:
+                            break
+                        if getattr(self.xhs_client, "verify_blocked", False):
+                            utils.logger.info(
+                                "[XiaoHongShuCrawler.search] 小红书被安全验证挡住了，先停翻页，用已经收下的列表。"
+                            )
+                            break
 
-                    # Sleep after each page navigation
-                    await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
-                    utils.logger.info(f"[XiaoHongShuCrawler.search] Sleeping for {config.CRAWLER_MAX_SLEEP_SEC} seconds after page {page-1}")
-                except DataFetchError:
-                    utils.logger.error("[XiaoHongShuCrawler.search] Get note detail error")
+                        # Sleep after each page navigation
+                        await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
+                        utils.logger.info(f"[XiaoHongShuCrawler.search] Sleeping for {config.CRAWLER_MAX_SLEEP_SEC} seconds after page {page-1}")
+                    except (DataFetchError, RetryError) as error:
+                        utils.logger.error(f"[XiaoHongShuCrawler.search] Get note detail error: {error}")
+                        break
+                if getattr(self.xhs_client, "verify_blocked", False):
                     break
+                if written == added:
+                    utils.logger.info(
+                        f"[XiaoHongShuCrawler.search] 策略{step_i + 1}没有新笔记，换下一档"
+                    )
+        mark_ladder_done("xhs")
 
     async def get_creators_and_notes(self) -> None:
         """Get creator's notes and retrieve their comment information."""
@@ -283,6 +390,37 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 await self.get_notice_media(note_detail)
         await self.batch_get_note_comments(need_get_comment_note_ids, xsec_tokens)
 
+    async def _attach_board_fans(self, note_detail: Dict) -> None:
+        if os.getenv("BOARD_KEEP_CREATORS") != "1" or not note_detail:
+            return
+        user = note_detail.get("user")
+        if not isinstance(user, dict):
+            return
+        existing = pick_fans(user, note_detail)
+        if existing:
+            user["fans"] = existing
+            return
+        user_id = str(user.get("user_id") or "").strip()
+        if not user_id:
+            return
+        if user_id in self._board_fans:
+            if self._board_fans[user_id]:
+                user["fans"] = self._board_fans[user_id]
+            return
+        try:
+            info = await self.xhs_client.get_creator_info(
+                user_id,
+                str(user.get("xsec_token") or ""),
+                str(note_detail.get("xsec_source") or "pc_search"),
+            )
+            fans = pick_fans(info or {})
+            self._board_fans[user_id] = fans
+            if fans:
+                user["fans"] = fans
+        except Exception as error:
+            utils.logger.info(f"[XiaoHongShuCrawler] 粉丝数没取到：{error}")
+            self._board_fans[user_id] = ""
+
     async def get_note_detail_async_task(
         self,
         note_id: str,
@@ -307,17 +445,25 @@ class XiaoHongShuCrawler(AbstractCrawler):
             try:
                 try:
                     note_detail = await self.xhs_client.get_note_by_id(note_id, xsec_source, xsec_token)
-                except RetryError:
-                    pass
+                except (RetryError, VerifyBlocked):
+                    note_detail = None
 
+                if not note_detail or not (
+                    note_detail.get("note_id") or note_detail.get("title")
+                ):
+                    note_detail = await self.xhs_client.get_note_by_id_from_page(
+                        note_id, xsec_source, xsec_token
+                    )
+                if not note_detail and not getattr(self.xhs_client, "detail_api_blocked", False):
+                    note_detail = await self.xhs_client.get_note_by_id_from_html(
+                        note_id, xsec_source, xsec_token, enable_cookie=True
+                    )
                 if not note_detail:
-                    note_detail = await self.xhs_client.get_note_by_id_from_html(note_id, xsec_source, xsec_token,
-                                                                                 enable_cookie=True)
-                    if not note_detail:
-                        utils.logger.warning(f"[skip] Failed to get note detail, Id: {note_id}, 跳过继续")
-                        return None
+                    utils.logger.warning(f"[skip] Failed to get note detail, Id: {note_id}, 跳过继续")
+                    return None
 
                 note_detail.update({"xsec_token": xsec_token, "xsec_source": xsec_source})
+                await self._attach_board_fans(note_detail)
 
                 # Sleep after fetching note detail
                 await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
@@ -424,20 +570,16 @@ class XiaoHongShuCrawler(AbstractCrawler):
             # feat issue #14
             # we will save login state to avoid login every time
             user_data_dir = os.path.join(os.getcwd(), "browser_data", config.USER_DATA_DIR % config.PLATFORM)  # type: ignore
-            browser_context = await chromium.launch_persistent_context(
-                user_data_dir=user_data_dir,
-                accept_downloads=True,
+            browser_context = await launch_persistent_chrome(
+                chromium,
+                user_data_dir,
                 headless=headless,
-                proxy=playwright_proxy,  # type: ignore
-                viewport={
-                    "width": 1920,
-                    "height": 1080
-                },
+                proxy=playwright_proxy,
                 user_agent=user_agent,
             )
             return browser_context
         else:
-            browser = await chromium.launch(headless=headless, proxy=playwright_proxy)  # type: ignore
+            browser = await chromium.launch(headless=headless, proxy=playwright_proxy, channel="chrome")  # type: ignore
             browser_context = await browser.new_context(viewport={"width": 1920, "height": 1080}, user_agent=user_agent)
             return browser_context
 

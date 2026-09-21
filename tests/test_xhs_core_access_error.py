@@ -122,3 +122,144 @@ async def test_creator_flow_skips_blocked_creator(monkeypatch):
 
     # 被限流的创作者整体跳过,后面的创作者照常采集
     assert crawled_user_ids == ["ok"]
+
+
+@pytest.mark.asyncio
+async def test_settle_unless_verify_runs_even_if_blocked(monkeypatch):
+    crawler = XiaoHongShuCrawler.__new__(XiaoHongShuCrawler)
+    crawler.context_page = object()
+    crawler.xhs_client = AsyncMock()
+    crawler.xhs_client.verify_blocked = True
+    settle = AsyncMock()
+    monkeypatch.setattr("media_platform.xhs.core.settle_if_idle", settle)
+    await crawler._settle_unless_verify()
+    settle.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_search_settles_after_first_saved_item(monkeypatch):
+    monkeypatch.setattr(config, "KEYWORDS", "python", raising=False)
+    monkeypatch.setattr(config, "CRAWLER_MAX_NOTES_COUNT", 1, raising=False)
+    monkeypatch.setattr(config, "START_PAGE", 1, raising=False)
+    monkeypatch.setattr(config, "SORT_TYPE", "", raising=False)
+    monkeypatch.setattr(config, "MAX_CONCURRENCY_NUM", 1, raising=False)
+    monkeypatch.setattr(config, "CRAWLER_MAX_SLEEP_SEC", 0, raising=False)
+    monkeypatch.setattr(config, "ENABLE_GET_COMMENTS", False, raising=False)
+    monkeypatch.setattr(config, "ENABLE_GET_MEIDAS", False, raising=False)
+
+    xhs_client = AsyncMock()
+    xhs_client.verify_blocked = True
+    xhs_client.detail_api_blocked = False
+    xhs_client.get_note_by_keyword = AsyncMock(
+        return_value={
+            "items": [
+                {
+                    "id": "n1",
+                    "model_type": "note",
+                    "xsec_source": "pc_search",
+                    "xsec_token": "tok",
+                }
+            ]
+        }
+    )
+    xhs_client.get_note_by_id = AsyncMock(return_value={"note_id": "n1", "title": "T"})
+    crawler = make_crawler(xhs_client)
+    crawler.context_page = object()
+    crawler._settle_unless_verify = AsyncMock()
+    crawler.get_notice_media = AsyncMock()
+    crawler.batch_get_note_comments = AsyncMock()
+    monkeypatch.setattr("media_platform.xhs.core.xhs_store.update_xhs_note", AsyncMock())
+    monkeypatch.setattr("media_platform.xhs.core.mark_ladder_done", lambda *_a, **_k: None)
+
+    await crawler.search()
+    assert crawler._settle_unless_verify.await_count >= 1
+
+
+def test_note_from_search_item_keeps_list_card():
+    from media_platform.xhs.help import note_from_search_item
+
+    note = note_from_search_item(
+        {
+            "id": "abc123",
+            "xsec_token": "tok",
+            "xsec_source": "pc_search",
+            "note_card": {
+                "display_title": "Python入门学习规划",
+                "desc": "路线图",
+                "type": "normal",
+                "user": {"nickname": "甲"},
+                "cover": {"url_default": "https://img.example/a.jpg"},
+            },
+        }
+    )
+    assert note["note_id"] == "abc123"
+    assert note["title"] == "Python入门学习规划"
+    assert note["image_list"][0]["url"] == "https://img.example/a.jpg"
+    assert note_from_search_item({"id": "x", "note_card": {}}) is None
+
+    sparse = note_from_search_item(
+        {
+            "id": "def456",
+            "note_card": {
+                "display_title": "只有封面结构",
+                "image_list": [
+                    {"url": None, "url_default": None, "info_list": [{"url": "https://img.example/b.jpg"}]}
+                ],
+            },
+        }
+    )
+    assert sparse["image_list"][0]["url"] == "https://img.example/b.jpg"
+
+
+def test_update_xhs_note_accepts_null_image_urls():
+    import asyncio
+    import store.xhs as xs
+
+    captured = {}
+
+    class FakeStore:
+        async def store_content(self, content_item):
+            captured.update(content_item)
+
+    orig = xs.XhsStoreFactory.create_store
+    xs.XhsStoreFactory.create_store = staticmethod(lambda: FakeStore())
+    try:
+        asyncio.run(
+            xs.update_xhs_note(
+                {
+                    "note_id": "n1",
+                    "type": "normal",
+                    "title": "列表卡",
+                    "desc": "没有详情",
+                    "time": 1,
+                    "user": {"user_id": "u1", "nickname": "甲"},
+                    "interact_info": {},
+                    "image_list": [
+                        {"url": None, "url_default": None, "info_list": [{"url": "https://img.example/c.jpg"}]},
+                    ],
+                    "tag_list": [],
+                    "xsec_token": "tok",
+                }
+            )
+        )
+    finally:
+        xs.XhsStoreFactory.create_store = orig
+    assert captured["note_id"] == "n1"
+    assert captured["image_list"] == "https://img.example/c.jpg"
+
+
+def test_pick_note_from_state_reads_camel_case_map():
+    from media_platform.xhs.extractor import XiaoHongShuExtractor
+
+    note = XiaoHongShuExtractor.pick_note_from_state(
+        {
+            "note": {
+                "noteDetailMap": {
+                    "n1": {"note": {"noteId": "n1", "title": "从页面收", "desc": "正文"}}
+                }
+            }
+        },
+        "n1",
+    )
+    assert note["note_id"] == "n1"
+    assert note["title"] == "从页面收"

@@ -40,6 +40,7 @@ class TiebaNote(BaseModel):
     total_replay_num: int = Field(default=0, description="Total reply count")
     total_replay_page: int = Field(default=0, description="Total reply pages")
     source_keyword: str = Field(default="", description="Source keyword")
+    image_list: str = Field(default="", description="Public image URLs")
 
 
 class TiebaComment(BaseModel):

@@ -40,6 +40,9 @@ from proxy.proxy_ip_pool import IpInfoModel, create_ip_pool
 from store import kuaishou as kuaishou_store
 from tools import utils
 from tools.cdp_browser import CDPBrowserManager
+from tools.chrome_launch import adopt_page, launch_persistent_chrome, settle_crawler_window
+from tools.search_ladders import mark_ladder_done, need_more, query_steps
+from tools.video_read import collect_video_text, duration_ms
 from var import comment_tasks_var, crawler_type_var, source_keyword_var
 
 from .client import KuaiShouClient
@@ -97,10 +100,18 @@ class KuaishouCrawler(AbstractCrawler):
                 await self.browser_context.add_init_script(path="libs/stealth.min.js")
 
 
-            self.context_page = await self.browser_context.new_page()
-            # 注入快手签名环境捕获脚本，页面加载后即可通过 __ks_realm 生成 __NS_hxfalcon 签名
-            await self.context_page.add_init_script(KS_SIGN_CAPTURE_SCRIPT)
-            await self.context_page.goto(f"{self.index_url}?isHome=1")
+            await self.browser_context.add_init_script(KS_SIGN_CAPTURE_SCRIPT)
+            self.context_page = await adopt_page(self.browser_context)
+            try:
+                await self.context_page.goto(
+                    f"{self.index_url}?isHome=1",
+                    wait_until="domcontentloaded",
+                    timeout=20000,
+                )
+            except Exception as error:
+                utils.logger.info(
+                    f"[KuaishouCrawler.start] 快手首页没完全加载完：{error}，窗口先留着。"
+                )
 
             # Create a client to interact with the kuaishou website.
             self.ks_client = await self.create_ks_client(httpx_proxy_format)
@@ -117,6 +128,7 @@ class KuaishouCrawler(AbstractCrawler):
                     browser_context=self.browser_context,
                     urls=self.cookie_urls,
                 )
+            await settle_crawler_window(self.context_page, "快手")
 
             crawler_type_var.set(config.CRAWLER_TYPE)
             if config.CRAWLER_TYPE == "search":
@@ -136,62 +148,79 @@ class KuaishouCrawler(AbstractCrawler):
     async def search(self):
         utils.logger.info("[KuaishouCrawler.search] Begin search kuaishou keywords")
         ks_limit_count = 20  # kuaishou limit page fixed value
-        if config.CRAWLER_MAX_NOTES_COUNT < ks_limit_count:
-            config.CRAWLER_MAX_NOTES_COUNT = ks_limit_count
+        wanted = max(1, int(config.CRAWLER_MAX_NOTES_COUNT or ks_limit_count))
         start_page = config.START_PAGE
-        for keyword in config.KEYWORDS.split(","):
-            search_session_id = ""
-            source_keyword_var.set(keyword)
-            utils.logger.info(
-                f"[KuaishouCrawler.search] Current search keyword: {keyword}"
-            )
-            page = 1
-            while (
-                page - start_page + 1
-            ) * ks_limit_count <= config.CRAWLER_MAX_NOTES_COUNT:
-                if page < start_page:
-                    utils.logger.info(f"[KuaishouCrawler.search] Skip page: {page}")
+        for seed in config.KEYWORDS.split(","):
+            seed = seed.strip()
+            if not seed:
+                continue
+            written = 0
+            seen_ids: set[str] = set()
+            for step_i, (step_name, keyword) in enumerate(query_steps(seed)):
+                if written >= wanted:
+                    break
+                if step_i and not need_more(written, wanted):
+                    break
+                source_keyword_var.set(keyword)
+                utils.logger.info(
+                    f"[KuaishouCrawler.search] 策略{step_i + 1} {step_name}：{keyword}"
+                )
+                search_session_id = ""
+                page = 1
+                added = written
+                empty_pages = 0
+                while written < wanted and (page - start_page) * ks_limit_count < wanted + ks_limit_count:
+                    if page < start_page:
+                        utils.logger.info(f"[KuaishouCrawler.search] Skip page: {page}")
+                        page += 1
+                        continue
+                    utils.logger.info(
+                        f"[KuaishouCrawler.search] search kuaishou keyword: {keyword}, page: {page}"
+                    )
+                    video_id_list: List[str] = []
+                    videos_res = await self.ks_client.search_info_by_keyword_v2(
+                        keyword=keyword,
+                        pcursor=str(page),
+                        search_session_id=search_session_id,
+                    )
+                    if not videos_res or videos_res.get("result") != 1:
+                        utils.logger.error(
+                            f"[KuaishouCrawler.search] search info by keyword:{keyword} not found data"
+                        )
+                        break
+                    search_session_id = videos_res.get("searchSessionId", "")
+                    feeds = videos_res.get("feeds") or []
+                    if not feeds:
+                        empty_pages += 1
+                        if empty_pages >= 2:
+                            break
+                    for video_detail in feeds:
+                        photo = video_detail.get("photo") or {}
+                        video_id = str(photo.get("id") or "")
+                        if not video_id or video_id in seen_ids:
+                            continue
+                        seen_ids.add(video_id)
+                        video_id_list.append(video_id)
+                        await kuaishou_store.update_kuaishou_video(video_item=video_detail)
+                        written += 1
+                        if written >= wanted:
+                            break
+                    utils.logger.info(
+                        f"[KuaishouCrawler.search] keyword: {keyword}, page: {page}, "
+                        f"got {len(video_id_list)} videos, written {written}/{wanted}"
+                    )
                     page += 1
-                    continue
-                utils.logger.info(
-                    f"[KuaishouCrawler.search] search kuaishou keyword: {keyword}, page: {page}"
-                )
-                video_id_list: List[str] = []
-                videos_res = await self.ks_client.search_info_by_keyword_v2(
-                    keyword=keyword,
-                    pcursor=str(page),
-                    search_session_id=search_session_id,
-                )
-                if not videos_res:
-                    utils.logger.error(
-                        f"[KuaishouCrawler.search] search info by keyword:{keyword} not found data"
+                    sleep_sec = config.CRAWLER_MAX_SLEEP_SEC + random.uniform(1, 3)
+                    await asyncio.sleep(sleep_sec)
+                    utils.logger.info(
+                        f"[KuaishouCrawler.search] Sleeping for {sleep_sec:.1f} seconds after page {page-1}"
                     )
-                    break
-
-                if videos_res.get("result") != 1:
-                    utils.logger.error(
-                        f"[KuaishouCrawler.search] search info by keyword:{keyword} not found data "
+                    await self.batch_get_video_comments(video_id_list)
+                if written == added:
+                    utils.logger.info(
+                        f"[KuaishouCrawler.search] 策略{step_i + 1}没有新视频，换下一档"
                     )
-                    break
-                search_session_id = videos_res.get("searchSessionId", "")
-                for video_detail in videos_res.get("feeds", []):
-                    video_id_list.append(video_detail.get("photo", {}).get("id"))
-                    await kuaishou_store.update_kuaishou_video(video_item=video_detail)
-
-                utils.logger.info(
-                    f"[KuaishouCrawler.search] keyword: {keyword}, page: {page}, got {len(video_id_list)} videos"
-                )
-
-                # batch fetch video comments
-                page += 1
-
-                # Sleep after page navigation
-                # 固定延时基础上加 1-3 秒随机抖动，降低服务端限流概率
-                sleep_sec = config.CRAWLER_MAX_SLEEP_SEC + random.uniform(1, 3)
-                await asyncio.sleep(sleep_sec)
-                utils.logger.info(f"[KuaishouCrawler.search] Sleeping for {sleep_sec:.1f} seconds after page {page-1}")
-
-                await self.batch_get_video_comments(video_id_list)
+        mark_ladder_done("ks")
 
     async def get_specified_videos(self):
         """Get the information and comments of the specified post"""
@@ -363,14 +392,12 @@ class KuaishouCrawler(AbstractCrawler):
             user_data_dir = os.path.join(
                 os.getcwd(), "browser_data", config.USER_DATA_DIR % config.PLATFORM
             )  # type: ignore
-            browser_context = await chromium.launch_persistent_context(
-                user_data_dir=user_data_dir,
-                accept_downloads=True,
+            browser_context = await launch_persistent_chrome(
+                chromium,
+                user_data_dir,
                 headless=headless,
-                proxy=playwright_proxy,  # type: ignore
-                viewport={"width": 1920, "height": 1080},
+                proxy=playwright_proxy,
                 user_agent=user_agent,
-                channel="chrome",  # Use system's stable Chrome version
             )
             return browser_context
         else:

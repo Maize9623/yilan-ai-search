@@ -92,14 +92,17 @@ class WeiboClient(ProxyRefreshMixin):
             raise DataFetchError(f"get response code error: {response.status_code}")
 
         ok_code = data.get("ok")
-        if ok_code == 0:  # response error
+        if ok_code == 0:
+            msg = str(data.get("msg") or "")
+            if any(token in msg for token in ("没有内容", "暂无", "没有结果")):
+                utils.logger.info(f"[WeiboClient.request] empty page: {msg}")
+                return data.get("data") or {"cards": []}
             utils.logger.error(f"[WeiboClient.request] request {method}:{url} err, res:{data}")
-            raise DataFetchError(data.get("msg", "response error"))
-        elif ok_code != 1:  # unknown error
+            raise DataFetchError(msg or "response error")
+        if ok_code != 1:
             utils.logger.error(f"[WeiboClient.request] request {method}:{url} err, res:{data}")
             raise DataFetchError(data.get("msg", "unknown error"))
-        else:  # response right
-            return data.get("data", {})
+        return data.get("data", {})
 
     async def get(self, uri: str, params=None, headers=None, **kwargs) -> Union[Response, Dict]:
         final_uri = uri
@@ -162,6 +165,8 @@ class WeiboClient(ProxyRefreshMixin):
         :param search_type: Search type, see SearchType enum in weibo/field.py
         :return:
         """
+        from urllib.parse import quote
+
         uri = "/api/container/getIndex"
         containerid = f"100103type={search_type.value}&q={keyword}"
         params = {
@@ -169,7 +174,15 @@ class WeiboClient(ProxyRefreshMixin):
             "page_type": "searchall",
             "page": page,
         }
-        return await self.get(uri, params)
+        headers = copy.deepcopy(self.headers)
+        headers["Referer"] = (
+            f"{self._host}/search?containerid=100103type%3D{search_type.value}"
+            f"%26q%3D{quote(keyword)}"
+        )
+        headers["X-Requested-With"] = "XMLHttpRequest"
+        headers["MWeibo-Pwa"] = "1"
+        headers["Accept"] = "application/json, text/plain, */*"
+        return await self.get(uri, params, headers=headers)
 
     async def get_note_comments(self, mid_id: str, max_id: int, max_id_type: int = 0) -> Dict:
         """get notes comments

@@ -38,11 +38,12 @@ from proxy.proxy_ip_pool import IpInfoModel, ProxyIpPool, create_ip_pool
 from store import tieba as tieba_store
 from tools import utils
 from tools.cdp_browser import CDPBrowserManager
+from tools.chrome_launch import adopt_page, launch_persistent_chrome, settle_crawler_window
 from var import crawler_type_var, source_keyword_var
 
 from .client import BaiduTieBaClient
 from .field import SearchNoteType, SearchSortType
-from .help import TieBaExtractor
+from .help import TieBaExtractor, search_keywords
 from .login import BaiduTieBaLogin
 
 
@@ -103,7 +104,7 @@ class TieBaCrawler(AbstractCrawler):
             # Inject anti-detection scripts - for Baidu's special detection
             await self._inject_anti_detection_scripts()
 
-            self.context_page = await self.browser_context.new_page()
+            self.context_page = await adopt_page(self.browser_context)
 
             # First visit Baidu homepage, then click Tieba link to avoid triggering security verification
             await self._navigate_to_tieba_via_baidu()
@@ -128,6 +129,7 @@ class TieBaCrawler(AbstractCrawler):
                     browser_context=self.browser_context,
                     urls=self.cookie_urls,
                 )
+            await settle_crawler_window(self.context_page, "贴吧")
 
             crawler_type_var.set(config.CRAWLER_TYPE)
             if config.CRAWLER_TYPE == "search":
@@ -154,19 +156,19 @@ class TieBaCrawler(AbstractCrawler):
         utils.logger.info(
             "[BaiduTieBaCrawler.search] Begin search baidu tieba keywords"
         )
-        tieba_limit_count = 10  # tieba limit page fixed value
-        if config.CRAWLER_MAX_NOTES_COUNT < tieba_limit_count:
-            config.CRAWLER_MAX_NOTES_COUNT = tieba_limit_count
+        wanted_notes = max(1, int(config.CRAWLER_MAX_NOTES_COUNT))
+        page_size = 10
         start_page = config.START_PAGE
-        for keyword in config.KEYWORDS.split(","):
+        max_page = start_page + max(6, (wanted_notes + page_size - 1) // page_size + 2)
+        for keyword in search_keywords(config.KEYWORDS):
             source_keyword_var.set(keyword)
             utils.logger.info(
                 f"[BaiduTieBaCrawler.search] Current search keyword: {keyword}"
             )
+            written = 0
+            seen_ids: set[str] = set()
             page = 1
-            while (
-                page - start_page + 1
-            ) * tieba_limit_count <= config.CRAWLER_MAX_NOTES_COUNT:
+            while written < wanted_notes and page <= max_page:
                 if page < start_page:
                     utils.logger.info(f"[BaiduTieBaCrawler.search] Skip page {page}")
                     page += 1
@@ -179,33 +181,58 @@ class TieBaCrawler(AbstractCrawler):
                         await self.tieba_client.get_notes_by_keyword(
                             keyword=keyword,
                             page=page,
-                            page_size=tieba_limit_count,
-                            sort=SearchSortType.TIME_DESC,
+                            page_size=page_size,
+                            sort=SearchSortType.RELEVANCE_ORDER,
                             note_type=SearchNoteType.FIXED_THREAD,
                         )
                     )
-                    if not notes_list:
-                        utils.logger.info(
-                            f"[BaiduTieBaCrawler.search] Search note list is empty"
-                        )
-                        break
-                    utils.logger.info(
-                        f"[BaiduTieBaCrawler.search] Note list len: {len(notes_list)}"
-                    )
-                    await self.get_specified_notes(
-                        note_id_list=[note_detail.note_id for note_detail in notes_list]
-                    )
-
-                    # Sleep after page navigation
-                    await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
-                    utils.logger.info(f"[TieBaCrawler.search] Sleeping for {config.CRAWLER_MAX_SLEEP_SEC} seconds after page {page}")
-
-                    page += 1
                 except Exception as ex:
                     utils.logger.error(
                         f"[BaiduTieBaCrawler.search] Search keywords error, current page: {page}, current keyword: {keyword}, err: {ex}"
                     )
                     break
+                if not notes_list:
+                    utils.logger.info(
+                        "[BaiduTieBaCrawler.search] Search note list is empty"
+                    )
+                    break
+                utils.logger.info(
+                    f"[BaiduTieBaCrawler.search] Note list len: {len(notes_list)}"
+                )
+                for note in notes_list:
+                    if written >= wanted_notes:
+                        break
+                    note_id = str(note.note_id or "")
+                    if not note_id or note_id in seen_ids:
+                        continue
+                    seen_ids.add(note_id)
+                    item = note
+                    try:
+                        detail = await self.tieba_client.get_note_by_id(note_id)
+                        if detail and detail.note_id:
+                            if not detail.desc and note.desc:
+                                detail.desc = note.desc
+                            if not detail.image_list and note.image_list:
+                                detail.image_list = note.image_list
+                            item = detail
+                    except Exception as error:
+                        utils.logger.info(
+                            f"[BaiduTieBaCrawler.search] 详情没取到 {note_id}：{error}，先写下搜索摘要。"
+                        )
+                    if not item.desc and not item.title:
+                        continue
+                    await tieba_store.update_tieba_note(item)
+                    written += 1
+                    utils.logger.info(
+                        f"[BaiduTieBaCrawler.search] 已写下第 {written} 条"
+                    )
+                    await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
+                if config.ENABLE_GET_COMMENTS:
+                    await self.batch_get_note_comments(
+                        [note for note in notes_list if note.note_id in seen_ids]
+                    )
+                page += 1
+                await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
 
     async def get_specified_tieba_notes(self):
         """
@@ -621,14 +648,12 @@ class TieBaCrawler(AbstractCrawler):
             user_data_dir = os.path.join(
                 os.getcwd(), "browser_data", config.USER_DATA_DIR % config.PLATFORM
             )  # type: ignore
-            browser_context = await chromium.launch_persistent_context(
-                user_data_dir=user_data_dir,
-                accept_downloads=True,
+            browser_context = await launch_persistent_chrome(
+                chromium,
+                user_data_dir,
                 headless=headless,
-                proxy=playwright_proxy,  # type: ignore
-                viewport={"width": 1920, "height": 1080},
+                proxy=playwright_proxy,
                 user_agent=user_agent,
-                channel="chrome",  # Use system's stable Chrome version
             )
             return browser_context
         else:

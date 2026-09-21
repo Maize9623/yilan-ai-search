@@ -52,18 +52,33 @@ class WeiboLogin(AbstractLogin):
         self.cookie_str = cookie_str
         self.weibo_sso_login_url = "https://passport.weibo.com/sso/signin?entry=miniblog&source=miniblog"
 
-    async def begin(self):
+    async def begin(self, ready=None):
         """Start login weibo"""
-        utils.logger.info("[WeiboLogin.begin] Begin login weibo ...")
-        if config.LOGIN_TYPE == "qrcode":
-            await self.login_by_qrcode()
-        elif config.LOGIN_TYPE == "phone":
-            await self.login_by_mobile()
-        elif config.LOGIN_TYPE == "cookie":
-            await self.login_by_cookies()
+        from tools.login_ready import already_logged_in, complete_login_if_needed
+
+        logged = False
+        if ready is not None:
+            try:
+                logged = bool(await ready())
+            except Exception:
+                logged = False
         else:
-            raise ValueError(
-                "[WeiboLogin.begin] Invalid Login Type Currently only supported qrcode or phone or cookie ...")
+            logged = await already_logged_in(self.browser_context, self.context_page, "wb")
+        if not logged:
+            try:
+                from tools.chrome_launch import restore_crawler_window
+
+                await restore_crawler_window(self.context_page)
+                await self.context_page.goto(self.weibo_sso_login_url)
+            except Exception:
+                utils.logger.info("[WeiboLogin.begin] 登录页没打开，请在 Chrome 窗口里自己打开微博登录。")
+        await complete_login_if_needed(
+            self.browser_context,
+            self.context_page,
+            "wb",
+            cookie_login=self.login_by_cookies,
+            ready=ready,
+        )
 
 
     @retry(stop=stop_after_attempt(600), wait=wait_fixed(1), retry=retry_if_result(lambda value: value is False))

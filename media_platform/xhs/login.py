@@ -31,6 +31,7 @@ import config
 from base.base_crawler import AbstractLogin
 from cache.cache_factory import CacheFactory
 from tools import utils
+from tools.login_ready import complete_login_if_needed
 
 
 class XiaoHongShuLogin(AbstractLogin):
@@ -81,20 +82,35 @@ class XiaoHongShuLogin(AbstractLogin):
         if current_web_session and current_web_session != no_logged_in_session:
             utils.logger.info("[XiaoHongShuLogin.check_login_state] Login status confirmed by Cookie (web_session changed).")
             return True
+        # Already logged in before this wait started: session will not change.
+        if current_web_session and len(current_web_session) > 16:
+            try:
+                qr_visible = await self.context_page.is_visible("img.qrcode-img", timeout=300)
+            except Exception:
+                qr_visible = False
+            if not qr_visible:
+                utils.logger.info("[XiaoHongShuLogin.check_login_state] Existing web_session accepted, QR is gone.")
+                return True
 
         return False
 
-    async def begin(self):
+    async def begin(self, ready=None):
         """Start login xiaohongshu"""
-        utils.logger.info("[XiaoHongShuLogin.begin] Begin login xiaohongshu ...")
-        if config.LOGIN_TYPE == "qrcode":
-            await self.login_by_qrcode()
-        elif config.LOGIN_TYPE == "phone":
-            await self.login_by_mobile()
-        elif config.LOGIN_TYPE == "cookie":
-            await self.login_by_cookies()
-        else:
-            raise ValueError("[XiaoHongShuLogin.begin]I nvalid Login Type Currently only supported qrcode or phone or cookies ...")
+        try:
+            login_button = self.context_page.locator(
+                "xpath=//*[@id='app']/div[1]/div[2]/div[1]/ul/div[1]/button"
+            )
+            if await login_button.is_visible(timeout=2000):
+                await login_button.click()
+        except Exception:
+            utils.logger.info("[XiaoHongShuLogin.begin] 登录按钮没自动点到，请在 Chrome 窗口里自己点登录。")
+        await complete_login_if_needed(
+            self.browser_context,
+            self.context_page,
+            "xhs",
+            cookie_login=self.login_by_cookies,
+            ready=ready,
+        )
 
     async def login_by_mobile(self):
         """Login xiaohongshu by mobile"""

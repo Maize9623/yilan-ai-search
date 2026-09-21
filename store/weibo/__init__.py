@@ -22,10 +22,11 @@
 # @Time    : 2024/1/14 21:34
 # @Desc    :
 
+import html
 import re
 from typing import List
 
-from tools.user_hash import anonymize_user_id, mask_nickname
+from tools.user_hash import anonymize_user_id, pick_fans, store_nickname
 from var import source_keyword_var
 
 from .weibo_store_media import *
@@ -79,11 +80,15 @@ async def update_weibo_note(note_item: Dict):
     if not note_item:
         return
 
+    from media_platform.weibo.help import weibo_pic_urls, weibo_tags
+
     mblog: Dict = note_item.get("mblog") or {}
     user_info: Dict = mblog.get("user") or {}
     note_id = mblog.get("id")
-    content_text = mblog.get("text")
-    clean_text = re.sub(r"<.*?>", "", content_text)
+    content_text = mblog.get("text") or mblog.get("text_raw") or ""
+    clean_text = html.unescape(re.sub(r"<.*?>", "", content_text))
+    image_list = weibo_pic_urls(mblog)
+    tag_list = weibo_tags(clean_text)
     # 教学版：原始 user_id 匿名化为 creator_hash，昵称脱敏；
     # 不采集头像/主页链接/性别/IP 归属地等可定位真人的信息。
     save_content_item = {
@@ -100,9 +105,15 @@ async def update_weibo_note(note_item: Dict):
 
         # 创作者信息（匿名化/脱敏，不含原始 user_id/avatar/gender/profile_url/ip_location）
         "creator_hash": anonymize_user_id(user_info.get("id")),
-        "nickname": mask_nickname(user_info.get("screen_name", "")),
+        "nickname": store_nickname(user_info.get("screen_name", "")),
+        "fans": pick_fans(user_info, mblog),
         "source_keyword": source_keyword_var.get(),
     }
+    # jsonl 给看板用；SQLite/ORM 会丢掉没有对应列的字段。
+    if image_list:
+        save_content_item["image_list"] = ",".join(image_list)
+    if tag_list:
+        save_content_item["tag_list"] = ",".join(tag_list)
     utils.logger.info(f"[store.weibo.update_weibo_note] weibo note id:{note_id}, title:{save_content_item.get('content')[:24]} ...")
     await WeibostoreFactory.create_store().store_content(content_item=save_content_item)
 
@@ -154,7 +165,7 @@ async def update_weibo_note_comment(note_id: str, comment_item: Dict):
 
         # 创作者信息（匿名化/脱敏，不含原始 user_id/avatar/gender/profile_url/ip_location）
         "creator_hash": anonymize_user_id(user_info.get("id")),
-        "nickname": mask_nickname(user_info.get("screen_name", "")),
+        "nickname": store_nickname(user_info.get("screen_name", "")),
     }
     utils.logger.info(f"[store.weibo.update_weibo_note_comment] Weibo note comment: {comment_id}, content: {save_comment_item.get('content', '')[:24]} ...")
     await WeibostoreFactory.create_store().store_comment(comment_item=save_comment_item)

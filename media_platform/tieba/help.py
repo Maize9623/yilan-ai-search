@@ -30,10 +30,66 @@ from parsel import Selector
 from constant import baidu_tieba as const
 from model.m_baidu_tieba import TiebaComment, TiebaCreator, TiebaNote
 from tools import utils
-from tools.user_hash import anonymize_user_id, mask_nickname
+from tools.user_hash import anonymize_user_id, store_nickname
 
 GENDER_MALE = "sex_male"
 GENDER_FEMALE = "sex_female"
+_TIEBA_IMG_SKIP = ("emoticon", "static", "tb/editor", "icon", "avatar")
+
+
+def search_keywords(raw: str) -> List[str]:
+    text = " ".join((raw or "").strip().split())
+    if not text:
+        return []
+    if "," in text:
+        parts = [part.strip() for part in text.split(",") if part.strip()]
+        if len(parts) > 1 and all(len(part) <= 16 and " " not in part for part in parts):
+            return parts
+    return [text]
+
+
+def tieba_pic_urls(content: Any) -> List[str]:
+    urls: List[str] = []
+
+    def add(url: str) -> None:
+        clean = (url or "").strip()
+        if clean.startswith("//"):
+            clean = "https:" + clean
+        if not clean.startswith("http"):
+            return
+        low = clean.lower()
+        if any(token in low for token in _TIEBA_IMG_SKIP):
+            return
+        if clean not in urls:
+            urls.append(clean)
+
+    if isinstance(content, str):
+        for src in re.findall(r'(?:src|data-src|origin_src)=["\']([^"\']+)["\']', content, flags=re.I):
+            add(src)
+        return urls[:8]
+    if isinstance(content, dict):
+        content = [content]
+    if not isinstance(content, list):
+        return []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        typ = str(item.get("type") or item.get("type_name") or "")
+        if typ in {"3", "img", "image", "pic"} or "img" in typ.lower():
+            add(
+                str(
+                    item.get("origin_src")
+                    or item.get("un_src")
+                    or item.get("src")
+                    or item.get("bsize_src")
+                    or ""
+                )
+            )
+        for key in ("origin_src", "un_src", "src"):
+            value = item.get(key)
+            if isinstance(value, str) and value.startswith("http"):
+                add(value)
+    return urls[:8]
 
 
 class TieBaExtractor:
@@ -145,10 +201,11 @@ class TieBaExtractor:
                     item.get("time") or item.get("create_time") or 0
                 ),
                 creator_hash=anonymize_user_id(user.get("id") or user.get("portrait") or ""),
-                user_nickname=mask_nickname(user.get("show_nickname") or user.get("user_name") or ""),
+                user_nickname=store_nickname(user.get("show_nickname") or user.get("user_name") or ""),
                 tieba_name=tieba_name,
                 tieba_link=self._tieba_link_from_name(tieba_name),
                 total_replay_num=item.get("post_num") or 0,
+                image_list=",".join(tieba_pic_urls(item.get("media") or item.get("content"))),
             )
             result.append(tieba_note)
         return result
@@ -178,11 +235,17 @@ class TieBaExtractor:
                 first_floor.get("time") or thread.get("create_time") or 0
             ),
             creator_hash=anonymize_user_id(self._api_user_link(author)),
-            user_nickname=mask_nickname(author.get("name_show") or author.get("name") or ""),
+            user_nickname=store_nickname(author.get("name_show") or author.get("name") or ""),
             tieba_name=tieba_name,
             tieba_link=self._tieba_link_from_name(tieba_name),
             total_replay_num=thread.get("reply_num") or 0,
             total_replay_page=page.get("total_page") or 0,
+            image_list=",".join(
+                tieba_pic_urls(
+                    first_floor.get("content")
+                    or thread.get("origin_thread_info", {}).get("content")
+                )
+            ),
         )
         return note
 
@@ -209,7 +272,7 @@ class TieBaExtractor:
                 content=self._extract_api_content_text(item.get("content")),
                 note_url=note_detail.note_url,
                 creator_hash=anonymize_user_id(self._api_user_link(user)),
-                user_nickname=mask_nickname(user.get("name_show") or user.get("name") or ""),
+                user_nickname=store_nickname(user.get("name_show") or user.get("name") or ""),
                 tieba_id=tieba_id,
                 tieba_name=tieba_name,
                 tieba_link=tieba_link,
@@ -230,7 +293,7 @@ class TieBaExtractor:
         # 教学版：创作者个人资料不再落库，仅保留匿名哈希与脱敏昵称作内存对象。
         return TiebaCreator(
             creator_hash=anonymize_user_id(str(user.get("id", ""))),
-            user_nickname=mask_nickname(str(user.get("name_show") or user.get("name") or "")),
+            user_nickname=store_nickname(str(user.get("name_show") or user.get("name") or "")),
             follows=int(user.get("concern_num") or 0),
             fans=int(user.get("fans_num") or 0),
             registration_duration=str(user.get("tb_age", "")),
@@ -358,7 +421,7 @@ class TieBaExtractor:
                 ),
                 note_url=note_url,
                 creator_hash=anonymize_user_id(extractor._absolute_url(user_selector.xpath("./@href").get(default=""))),
-                user_nickname=mask_nickname(extractor._selector_text(
+                user_nickname=store_nickname(extractor._selector_text(
                     post, ".//a[contains(@href, '/home/main')][1]"
                 )),
                 tieba_name=extractor._selector_text(
@@ -439,7 +502,7 @@ class TieBaExtractor:
                 desc=desc,
                 note_url=f"{const.TIEBA_URL}/p/{note_id}",
                 creator_hash="",
-                user_nickname=mask_nickname(user_nickname),
+                user_nickname=store_nickname(user_nickname),
                 tieba_name=tieba_name,
                 tieba_link=tieba_link,
                 publish_time=publish_time,
@@ -487,7 +550,7 @@ class TieBaExtractor:
                 ),
                 note_url=const.TIEBA_URL + f"/p/{note_id}",
                 creator_hash=anonymize_user_id(self._absolute_url(user_selector.xpath("./@href").get(default=""))),
-                user_nickname=mask_nickname(user_nickname),
+                user_nickname=store_nickname(user_nickname),
                 tieba_name=tieba_name,
                 tieba_link=tieba_link,
                 total_replay_num=post_field_value.get("reply_num", 0),
@@ -536,7 +599,7 @@ class TieBaExtractor:
             desc=content_selector.xpath("//meta[@name='description']/@content").get(default="").strip(),
             note_url=const.TIEBA_URL + f"/p/{note_id}",
             creator_hash=anonymize_user_id(self._absolute_url(author_link)),
-            user_nickname=mask_nickname(
+            user_nickname=store_nickname(
                 self._selector_text(first_floor_selector, f".//a[{self._class_contains('p_author_name')}][1]")
                 or author_value.get("user_nickname")
                 or author_value.get("user_name", "")
@@ -607,7 +670,7 @@ class TieBaExtractor:
                 content=utils.extract_text_from_html(content_html),
                 note_url=const.TIEBA_URL + f"/p/{note_id}",
                 creator_hash=anonymize_user_id(self._absolute_url(user_selector.xpath("./@href").get(default=""))),
-                user_nickname=mask_nickname(user_nickname),
+                user_nickname=store_nickname(user_nickname),
                 tieba_id=str(comment_content_value.get("forum_id", "")),
                 tieba_name=tieba_name,
                 tieba_link=tieba_link,
@@ -644,7 +707,7 @@ class TieBaExtractor:
             comment = TiebaComment(
                 comment_id=str(comment_value.get("spid")), content=content,
                 creator_hash=anonymize_user_id(self._absolute_url(comment_user_a_selector.xpath("./@href").get(default=""))),
-                user_nickname=mask_nickname(str(comment_value.get("showname") or "")),
+                user_nickname=store_nickname(str(comment_value.get("showname") or "")),
                 publish_time=self._selector_text(comment_ele, f".//span[{self._class_contains('lzl_time')}]"),
                 parent_comment_id=parent_comment.comment_id,
                 note_id=parent_comment.note_id, note_url=parent_comment.note_url,
@@ -677,7 +740,7 @@ class TieBaExtractor:
         user_content = userinfo_userdata_selector.get(default='')
         # 教学版：创作者个人资料不再落库，仅保留匿名哈希与脱敏昵称作内存对象。
         return TiebaCreator(creator_hash=anonymize_user_id(user_id or user_link),
-                            user_nickname=mask_nickname(
+                            user_nickname=store_nickname(
                                 selector.xpath(".//span[@class='userinfo_username ']/text()").get(
                                     default='').strip()
                                 or user_name
